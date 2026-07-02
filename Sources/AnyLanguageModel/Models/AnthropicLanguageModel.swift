@@ -218,6 +218,9 @@ public struct AnthropicLanguageModel: LanguageModel {
             /// internal reasoning process. Larger budgets can improve response quality
             /// for complex tasks but increase latency and cost.
             public var budgetTokens: Int?
+            
+            /// How thinking should be displayed.
+            public var display: ThinkingDisplay?
 
             /// The type of thinking mode.
             public enum ThinkingType: String, Hashable, Codable, Sendable {
@@ -225,6 +228,13 @@ public struct AnthropicLanguageModel: LanguageModel {
                 case enabled
                 /// Enables adaptive thinking.
                 case adaptive
+            }
+            
+            public enum ThinkingDisplay: String, Hashable, Codable, Sendable {
+                /// Thinking will be summarized.
+                case summarized
+                /// No thoughts will be returned.
+                case omitted
             }
 
             enum CodingKeys: String, CodingKey {
@@ -237,19 +247,20 @@ public struct AnthropicLanguageModel: LanguageModel {
             /// - Parameters:
             ///   - type: The type of thinking to perform.
             ///   - budgetTokens: The maximum number of tokens to use for thinking.
-            public init(type: ThinkingType, budgetTokens: Int?) {
+            public init(type: ThinkingType, budgetTokens: Int?, display: ThinkingDisplay?) {
                 self.type = type
                 self.budgetTokens = budgetTokens
+                self.display = display
             }
             
             /// Convenience function for enabling adaptive thinking on supported models.
-            public static func adaptive() -> Thinking {
-                return Thinking.init(type: .adaptive, budgetTokens: nil)
+            public static func adaptive(display: ThinkingDisplay?) -> Thinking {
+                return Thinking.init(type: .adaptive, budgetTokens: nil, display: display)
             }
             
             /// Convenience function for enabling thinking with a token budget on supported models.
-            public static func enabled(budgetTokens: Int) -> Thinking {
-                return Thinking.init(type: .enabled, budgetTokens: budgetTokens)
+            public static func enabled(budgetTokens: Int, display: ThinkingDisplay?) -> Thinking {
+                return Thinking.init(type: .enabled, budgetTokens: budgetTokens, display: display)
             }
         }
 
@@ -641,6 +652,9 @@ private func createMessageParams(
             ]
             if let budget = thinking.budgetTokens {
                 thinkingObject["budget_tokens"] = .int(budget)
+            }
+            if let display = thinking.display {
+                thinkingObject["display"] = .string(display.rawValue)
             }
             
             params["thinking"] = .object(thinkingObject)
