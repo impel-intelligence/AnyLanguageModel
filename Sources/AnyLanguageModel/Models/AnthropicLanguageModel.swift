@@ -506,15 +506,16 @@ public struct AnthropicLanguageModel: LanguageModel {
 
                     let responseSchema =
                         type == String.self ? nil : try convertSchemaToAnthropicFormat(Content.generationSchema)
+                    
                     var params = try createMessageParams(
                         model: model,
                         system: nil,
                         messages: session.transcript.toAnthropicMessages(),
                         tools: anthropicTools.isEmpty ? nil : anthropicTools,
                         responseSchema: responseSchema,
-                        options: options
+                        options: options,
+                        stream: true
                     )
-                    params["stream"] = .bool(true)
 
                     let body = try JSONEncoder().encode(params)
 
@@ -591,7 +592,8 @@ private func createMessageParams(
     messages: [AnthropicMessage],
     tools: [AnthropicTool]?,
     responseSchema: JSONSchema?,
-    options: GenerationOptions
+    options: GenerationOptions,
+    stream: Bool? = nil
 ) throws -> [String: JSONValue] {
     var params: [String: JSONValue] = [
         "model": .string(model),
@@ -697,6 +699,10 @@ private func createMessageParams(
             for (key, value) in extraBody {
                 params[key] = value
             }
+        }
+        
+        if let stream {
+            params["stream"] = .bool(stream)
         }
     }
 
