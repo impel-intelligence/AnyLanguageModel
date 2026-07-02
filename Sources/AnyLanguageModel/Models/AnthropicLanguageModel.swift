@@ -910,7 +910,6 @@ private struct AnthropicThinking: Codable, Sendable {
     }
 }
 
-
 private struct AnthropicText: Codable, Sendable {
     let type: String
     let text: String
