@@ -175,14 +175,8 @@ public final class LanguageModelSession: @unchecked Sendable {
                             textContent = lastSnapshot.rawContent.jsonString
                         }
 
-                        let responseEntry = Transcript.Entry.response(
-                            Transcript.Response(
-                                assetIDs: [],
-                                segments: [.text(.init(content: textContent))]
-                            )
-                        )
                         session.withMutation(keyPath: \.transcript) {
-                            session.state.withLock { $0.transcript.append(responseEntry) }
+                            session.state.withLock { $0.transcript.finalizeStreamedTranscript(textContent, assetIDs: []) }
                         }
                     }
                 } catch {
