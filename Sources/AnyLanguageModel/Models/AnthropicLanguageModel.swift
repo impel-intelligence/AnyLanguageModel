@@ -676,11 +676,15 @@ public struct AnthropicLanguageModel: LanguageModel {
                                 if !invocations.isEmpty {
                                     var toolResultBlocks: [AnthropicContent] = []
                                     
+                                    // Need to append tool calls before tool results
+                                    session.appendTranscriptEntry(
+                                        .toolCalls(Transcript.ToolCalls(invocations.map(\.call)))
+                                    )
+                                    
                                     for invocation in invocations {
                                         // Save the tool outputs into the transcript.
                                         session.appendTranscriptEntry(.toolOutput(invocation.output))
                                         
-                                        //
                                         toolResultBlocks.append(
                                             .toolResult(
                                                 AnthropicToolResult(
@@ -692,10 +696,6 @@ public struct AnthropicLanguageModel: LanguageModel {
                                     }
                                     
                                     messages.append(AnthropicMessage(role: .user, content: toolResultBlocks))
-                                    session.appendTranscriptEntry(
-                                        .toolCalls(Transcript.ToolCalls(invocations.map(\.call)))
-                                    )
-
                                     appendedToolResults = true
                                 }
                             }
@@ -1087,6 +1087,8 @@ extension Transcript {
                         )
                     )
                 }
+                
+                print("Tool use block \(toolUseBlocks)")
                 messages.append(
                     .init(
                         role: .assistant,
@@ -1095,6 +1097,7 @@ extension Transcript {
                 )
             case .toolOutput(let toolOutput):
                 // Add user message with tool result
+                print("tool output \(toolOutput.id)")
                 messages.append(
                     .init(
                         role: .user,
