@@ -59,7 +59,7 @@ public struct Transcript: Sendable, Equatable, Codable {
     ///   - assetIDs: The assetIDs for the response.
     mutating func finalizeStreamedTranscript(_ text: String, assetIDs: [String]) {
         // Make sure the last entry in the transcript is a response. If it is not, create a new response and append it to the end of the transcript.
-        guard case .response(var response) = entries.last else {
+        guard case .response(let response) = entries.last else {
             append(Entry.response(Response(assetIDs: assetIDs, segments: [
                 Transcript.Segment.text(Transcript.TextSegment(content: text))
             ])))

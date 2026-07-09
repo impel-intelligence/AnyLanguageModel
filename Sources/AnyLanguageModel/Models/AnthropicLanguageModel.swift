@@ -230,6 +230,7 @@ public struct AnthropicLanguageModel: LanguageModel {
                 case adaptive
             }
             
+            /// How thinking should be returned during generation.
             public enum ThinkingDisplay: String, Hashable, Codable, Sendable {
                 /// Thinking will be summarized.
                 case summarized
@@ -240,13 +241,15 @@ public struct AnthropicLanguageModel: LanguageModel {
             enum CodingKeys: String, CodingKey {
                 case type
                 case budgetTokens = "budget_tokens"
+                case display
             }
 
             /// Creates a thinking configuration.
             /// 
             /// - Parameters:
             ///   - type: The type of thinking to perform.
-            ///   - budgetTokens: The maximum number of tokens to use for thinking.
+            ///   - budgetTokens: The maximum number of tokens to use for thinking. Only required when `type` == `.enabled`.
+            ///   - display: The display type for thoughts.
             public init(type: ThinkingType, budgetTokens: Int?, display: ThinkingDisplay?) {
                 self.type = type
                 self.budgetTokens = budgetTokens
@@ -385,7 +388,6 @@ public struct AnthropicLanguageModel: LanguageModel {
         
         var entries: [Transcript.Entry] = []
         var runningText = ""
-        var lastOutput: [AnthropicContent]?
         var messages: [AnthropicMessage] = session.transcript.toAnthropicMessages()
         
         // Loop until no more tool calls are found.
@@ -416,7 +418,6 @@ public struct AnthropicLanguageModel: LanguageModel {
                 if case .toolUse(let u) = content { return u }
                 return nil
             }
-            lastOutput = message.content
 
             if !toolUses.isEmpty {
                 let resolution = try await resolveToolUses(toolUses, session: session)
@@ -526,7 +527,7 @@ public struct AnthropicLanguageModel: LanguageModel {
                         var accumulatedText: String = ""
                         var stopReason: String? = nil
 
-                        var params = try createMessageParams(
+                        let params = try createMessageParams(
                             model: model,
                             system: nil,
                             messages: messages,
@@ -627,7 +628,7 @@ public struct AnthropicLanguageModel: LanguageModel {
                             case .messageStop:
                                 // Need to use a label, otherwise this would break out of the switch.
                                 break eventStream
-                            case .ping, .ignored, .messageStart, .messageStop, .contentBlockStop:
+                            case .ping, .ignored, .messageStart, .contentBlockStop:
                                 continue
                             }
                         }
