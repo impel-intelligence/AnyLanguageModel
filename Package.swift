@@ -26,11 +26,18 @@ let package = Package(
         .trait(name: "MLX"),
         .trait(name: "Llama"),
         .trait(name: "AsyncHTTPClient"),
-        .default(enabledTraits: []),
+        .trait(name: "Xet", description: "Enable Xet transport support in swift-huggingface."),
+        .default(enabledTraits: ["Xet"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"),
-        .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
+//        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"),
+        .package(url: "https://github.com/impel-intelligence/swift-transformers", from: "1.0.0", traits: [
+            .trait(name: "Xet", condition: .when(traits: ["Xet"]))
+        ]),
+//        .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
+        .package(url: "https://github.com/impel-intelligence/swift-huggingface", from: "1.0.1", traits: [
+            .trait(name: "Xet", condition: .when(traits: ["Xet"]))
+        ]),
         .package(
             url: "https://github.com/mattt/EventSource",
             from: "1.3.0",
