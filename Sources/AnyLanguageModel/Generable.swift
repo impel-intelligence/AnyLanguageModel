@@ -164,6 +164,12 @@ extension Int: Generable {
     /// Creates an instance with the content.
     public init(_ content: GeneratedContent) throws {
         guard case .number(let value) = content.kind else {
+            // If the content kind is not a number, check if it is a string and then see if that string is a number.
+            if case .string(let stringValue) = content.kind, let value = Int(stringValue) {
+                self = value
+                return
+            }
+            
             throw GeneratedContentConversionError.typeMismatch
         }
         self = Int(value)
