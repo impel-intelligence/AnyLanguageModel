@@ -1043,6 +1043,17 @@ import Foundation
                 transcriptEntries: ArraySlice(allEntries)
             )
         }
+        
+        struct ContentAccumulationBlocks: Hashable, Codable, Sendable {
+            enum Kind: Hashable, Codable, Sendable { case toolUse, text }
+            
+            var kind: Kind
+            var text: String
+
+            // Used by tool use content blocks
+            var id: String?
+            var name: String?
+        }
 
         public func streamResponse<Content>(
             within session: LanguageModelSession,
@@ -1067,6 +1078,8 @@ import Foundation
             let hub = self.hub
             let directory = self.directory
             let gpuMemory = self.gpuMemory
+
+            let toolSpecs = mlxToolSpecs(for: session)
 
             let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init {
                 continuation in
@@ -1103,63 +1116,129 @@ import Foundation
                         let userInputProcessing =
                             options[custom: MLXLanguageModel.self]?.processingForUserInput
                             ?? .init(resize: nil)
-                        let chat = convertTranscriptToMLXChat(
-                            session: session,
-                            fallbackPrompt: prompt.description
-                        )
+                        
+                        var chat = convertTranscriptToMLXChat(session: session, fallbackPrompt: prompt.description)
+                        
+                        var previousToolCallSignature: String?
 
-                        let userInput = makeUserInput(
-                            chat: chat,
-                            tools: nil,
-                            processing: userInputProcessing,
-                            additionalContext: additionalContext
-                        )
-                        let lmInput = try await context.processor.prepare(input: userInput)
-                        let resolved = resolveCache(
-                            session: session,
-                            lmInput: lmInput,
-                            generateParameters: generateParameters,
-                            context: context
-                        )
+                        // Loop until no more tool calls
+                        while true {
+                            let userInput = makeUserInput(
+                                chat: chat,
+                                tools: toolSpecs,
+                                processing: userInputProcessing,
+                                additionalContext: additionalContext
+                            )
+                            
+                            let lmInput = try await context.processor.prepare(input: userInput)
+                            
+                            let resolved = resolveCache(
+                                session: session,
+                                lmInput: lmInput,
+                                generateParameters: generateParameters,
+                                context: context
+                            )
 
-                        let mlxStream = try MLXLMCommon.generate(
-                            input: resolved.input,
-                            cache: resolved.cache,
-                            parameters: generateParameters,
-                            context: context
-                        )
-
-                        var accumulatedText = ""
-                        for await item in mlxStream {
-                            if Task.isCancelled { break }
-
-                            switch item {
-                            case .chunk(let text):
-                                accumulatedText += text
-                                let raw = GeneratedContent(accumulatedText)
-                                let content: Content.PartiallyGenerated = (accumulatedText as! Content)
-                                    .asPartiallyGenerated()
-                                continuation.yield(.init(content: content, rawContent: raw))
-                            case .info, .toolCall:
-                                break
+                            let mlxStream = try MLXLMCommon.generate(
+                                input: resolved.input,
+                                cache: resolved.cache,
+                                parameters: generateParameters,
+                                context: context
+                            )
+                            
+                            var collectedToolCalls: [MLXLMCommon.ToolCall] = []
+                            var runInfo: GenerateCompletionInfo?
+                            var accumulatedText = ""
+                            
+                            for await item in mlxStream {
+                                if Task.isCancelled { break }
+                                
+                                switch item {
+                                case .chunk(let text):
+                                    accumulatedText += text
+                                    let raw = GeneratedContent(accumulatedText)
+                                    let content: Content.PartiallyGenerated = (accumulatedText as! Content)
+                                        .asPartiallyGenerated()
+                                    
+                                    continuation.yield(.init(content: content, rawContent: raw))
+                                    
+                                    session.growStreamingTranscript(text: accumulatedText)
+                                case .info(let info):
+                                    runInfo = info
+                                case .toolCall(let call):
+                                    collectedToolCalls.append(call)
+                                }
                             }
-                        }
 
-                        storeSessionCache(
-                            cache: resolved.cache,
-                            fullTokens: resolved.fullTokens,
-                            generateParameters: generateParameters,
-                            session: session
-                        )
+                            storeSessionCache(
+                                cache: resolved.cache,
+                                fullTokens: resolved.fullTokens,
+                                generateParameters: generateParameters,
+                                session: session
+                            )
+
+                            // Add assistant response to chat history
+                            if !accumulatedText.isEmpty {
+                                chat.append(.assistant(accumulatedText))
+                            }
+
+                            // If there are tool calls, execute them and continue
+                            if !collectedToolCalls.isEmpty {
+                                let signature = collectedToolCalls.map { "\($0.function.name):\($0.function.arguments)" }.joined(separator: "|")
+                                if signature == previousToolCallSignature {
+                                    let unresolvedCalls = try makeTranscriptToolCalls(from: collectedToolCalls)
+                                    
+                                    session.appendTranscriptEntry(
+                                        .toolCalls(Transcript.ToolCalls(unresolvedCalls))
+                                    )
+
+                                    throw Self.repeatedToolCallLoopError()
+                                }
+                                previousToolCallSignature = signature
+
+                                let resolution = try await resolveToolCalls(collectedToolCalls, session: session)
+                                switch resolution {
+                                case .stop(let calls):
+                                    if !calls.isEmpty {
+                                        session.appendTranscriptEntry(.toolCalls(Transcript.ToolCalls(calls)))
+                                    }
+                                    
+                                    continuation.finish()
+                                    return
+                                case .invocations(let invocations):
+                                    if !invocations.isEmpty {
+                                        session.appendTranscriptEntry(.toolCalls(Transcript.ToolCalls(invocations.map(\.call))))
+                                        
+                                        // Execute each tool and add results to chat
+                                        for invocation in invocations {
+                                            session.appendTranscriptEntry(.toolOutput(invocation.output))
+
+                                            // Convert tool output to JSON string for MLX
+                                            let toolResultJSON = toolOutputToJSON(invocation.output)
+                                            chat.append(.tool(toolResultJSON))
+                                        }
+
+                                        // Continue loop to generate with tool results
+                                        continue
+                                    }
+                                }
+                            }
+
+                            // No more tool calls, exit loop
+                            break
+                        }
+                        
                         finishScope()
                         finishGenerationSlot()
                         continuation.finish()
                     } catch {
+                        print("Generation failed with error: \(error)")
                         finishScope()
                         finishGenerationSlot()
                         continuation.finish(throwing: error)
                     }
                 }
+                
                 continuation.onTermination = { _ in
                     didEndScope.withLock { done in
                         if !done {
