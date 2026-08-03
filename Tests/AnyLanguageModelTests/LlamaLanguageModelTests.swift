@@ -401,5 +401,85 @@ import Testing
             #expect(response.content.choices.count == 4)
             #expect(!response.content.answer.isEmpty)
         }
+
+        // MARK: - Tool Calling
+        //
+        // These require a GGUF model that has actually been trained to emit tool calls in one of
+        // the text formats `LlamaLanguageModel` parses (Hermes/Qwen `<tool_call>`, Llama 3.x
+        // `<|python_tag|>`, Mistral `[TOOL_CALLS]`, or `<function=...>`). Like the rest of this
+        // suite they are gated on `LLAMA_MODEL_PATH`; pointing that at a model without tool
+        // training will fail here rather than skip, which is the honest signal.
+
+        @Test func withTools() async throws {
+            let weatherTool = WeatherTool()
+            let session = LanguageModelSession(model: model, tools: [weatherTool])
+
+            let response = try await session.respond(
+                to: "How's the weather in San Francisco?",
+                options: GenerationOptions(maximumResponseTokens: 512)
+            )
+
+            var foundToolOutput = false
+            for case let .toolOutput(toolOutput) in response.transcriptEntries {
+                #expect(!toolOutput.id.isEmpty)
+                #expect(toolOutput.toolName == "getWeather")
+                foundToolOutput = true
+            }
+            #expect(foundToolOutput)
+        }
+
+        @Test func streamWithTools() async throws {
+            let weatherTool = WeatherTool()
+            let session = LanguageModelSession(model: model, tools: [weatherTool])
+
+            let stream = session.streamResponse(
+                to: "How's the weather in San Francisco?",
+                options: GenerationOptions(maximumResponseTokens: 512)
+            )
+
+            var streamedText: [String] = []
+
+            var toolAppearedInTranscript = false
+            var toolResponseAppearedInTranscript = false
+
+            for try await snapshot in stream {
+                streamedText.append(snapshot.content)
+
+                for entry in session.transcript {
+                    switch entry {
+                    case .toolCalls:
+                        toolAppearedInTranscript = true
+                    case .toolOutput:
+                        toolResponseAppearedInTranscript = true
+                    default: break
+                    }
+                }
+            }
+
+            #expect(toolAppearedInTranscript, "Expected a tool call to appear in the transcript during streaming.")
+            #expect(
+                toolResponseAppearedInTranscript,
+                "Expected a tool output to appear in the transcript during streaming."
+            )
+
+            // Tool calls must be recorded before the outputs they produced.
+            let firstToolCallIndex = session.transcript.firstIndex { entry in
+                if case .toolCalls = entry { return true }
+                return false
+            }
+            let firstToolOutputIndex = session.transcript.firstIndex { entry in
+                if case .toolOutput = entry { return true }
+                return false
+            }
+            if let firstToolCallIndex, let firstToolOutputIndex {
+                #expect(firstToolCallIndex < firstToolOutputIndex)
+            }
+
+            // Tool-call markup must never be surfaced to the caller as response text.
+            let leakedMarkup = streamedText.filter { text in
+                text.contains("<tool_call>") || text.contains("<|python_tag|>") || text.contains("[TOOL_CALLS]")
+            }
+            #expect(leakedMarkup.isEmpty, "Tool-call markup leaked into streamed response text.")
+        }
     }
 #endif  // Llama
