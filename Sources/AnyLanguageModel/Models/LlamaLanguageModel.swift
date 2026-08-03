@@ -1906,9 +1906,14 @@ import Foundation
     }
 
     // MARK: - Tool Call Parsing
+    //
+    // The pure parsing helpers below are `internal` rather than file-private so that
+    // `LlamaLanguageModelTests` can unit-test them without a local GGUF model. They are the only
+    // substantial new logic here that can be exercised in CI. Nothing becomes public API, and the
+    // tool *invocation* helpers further down stay file-private since they need a live session.
 
     /// A tool call recovered from the model's generated text.
-    private struct ParsedLlamaToolCall {
+    internal struct ParsedLlamaToolCall {
         let name: String
         let arguments: GeneratedContent
     }
@@ -1930,13 +1935,13 @@ import Foundation
     ///
     /// Any other family-specific syntax is *not* supported and its text will be returned to the
     /// caller as ordinary model output.
-    private let llamaToolCallMarkers = ["<tool_call>", "<|python_tag|>", "[TOOL_CALLS]", "<function="]
+    internal let llamaToolCallMarkers = ["<tool_call>", "<|python_tag|>", "[TOOL_CALLS]", "<function="]
 
     /// Returns the range of the balanced JSON container starting at or after `start`.
     ///
     /// Brace matching is string- and escape-aware so that braces inside string literals do not
     /// terminate the scan early.
-    private func llamaBalancedJSONRange(in text: String, from start: String.Index) -> Range<String.Index>? {
+    internal func llamaBalancedJSONRange(in text: String, from start: String.Index) -> Range<String.Index>? {
         var index = start
         while index < text.endIndex, text[index].isWhitespace {
             index = text.index(after: index)
@@ -1983,7 +1988,7 @@ import Foundation
     }
 
     /// Decodes one tool call from a already-parsed JSON value.
-    private func llamaToolCall(fromObject object: Any, defaultName: String? = nil) -> ParsedLlamaToolCall? {
+    internal func llamaToolCall(fromObject object: Any, defaultName: String? = nil) -> ParsedLlamaToolCall? {
         guard var dictionary = object as? [String: Any] else { return nil }
 
         // OpenAI-shaped nesting: {"type": "function", "function": {"name": ..., "arguments": ...}}
@@ -2011,7 +2016,7 @@ import Foundation
     }
 
     /// Decodes one or more tool calls from a JSON object or array.
-    private func llamaToolCalls(fromJSON json: String, defaultName: String? = nil) -> [ParsedLlamaToolCall] {
+    internal func llamaToolCalls(fromJSON json: String, defaultName: String? = nil) -> [ParsedLlamaToolCall] {
         guard let object = try? JSONSerialization.jsonObject(with: Data(json.utf8)) else { return [] }
         if let array = object as? [Any] {
             return array.compactMap { llamaToolCall(fromObject: $0, defaultName: defaultName) }
@@ -2022,7 +2027,7 @@ import Foundation
     /// Splits generated text into the prose a caller should see and the tool calls embedded in it.
     ///
     /// See ``llamaToolCallMarkers`` for the exact set of supported formats.
-    private func llamaSplitToolCalls(
+    internal func llamaSplitToolCalls(
         from text: String,
         knownToolNames: Set<String>
     ) -> (visibleText: String, toolCalls: [ParsedLlamaToolCall]) {
@@ -2121,7 +2126,7 @@ import Foundation
     }
 
     /// Advances past `token` if it is the next non-whitespace content, otherwise returns `index`.
-    private func llamaConsuming(_ token: String, in text: String, from index: String.Index) -> String.Index {
+    internal func llamaConsuming(_ token: String, in text: String, from index: String.Index) -> String.Index {
         var probe = index
         while probe < text.endIndex, text[probe].isWhitespace {
             probe = text.index(after: probe)
@@ -2134,7 +2139,7 @@ import Foundation
     ///
     /// Tool-call markup arrives inline with prose, so streaming must withhold any text that has
     /// begun — or might still turn into — a tool call.
-    private func llamaStreamableVisiblePrefix(of text: String) -> String {
+    internal func llamaStreamableVisiblePrefix(of text: String) -> String {
         // A response opening with a JSON container may be a bare-JSON tool call, which cannot be
         // recognized until generation finishes. Withhold all of it until then.
         let leading = text.drop(while: { $0.isWhitespace })

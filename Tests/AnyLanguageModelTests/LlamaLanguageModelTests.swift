@@ -482,4 +482,179 @@ import Testing
             #expect(leakedMarkup.isEmpty, "Tool-call markup leaked into streamed response text.")
         }
     }
+
+    /// Unit tests for the tool-call text parser.
+    ///
+    /// Deliberately **not** gated on `LLAMA_MODEL_PATH`: local models express tool calls as
+    /// generated text in family-specific formats, so this parser is the substance of Llama tool
+    /// calling, and it must be verifiable with no model present.
+    @Suite("LlamaToolCallParsing")
+    struct LlamaToolCallParsingTests {
+        /// The single registered tool used by these cases.
+        static let knownTools: Set<String> = ["getWeather"]
+
+        private func split(
+            _ text: String,
+            tools: Set<String> = LlamaToolCallParsingTests.knownTools
+        ) -> (names: [String], arguments: [String], visible: String) {
+            let result = llamaSplitToolCalls(from: text, knownToolNames: tools)
+            return (
+                result.toolCalls.map(\.name),
+                result.toolCalls.map { $0.arguments.jsonString },
+                result.visibleText
+            )
+        }
+
+        // MARK: Supported formats
+
+        @Test func hermesToolCall() {
+            let result = split(
+                "<tool_call>\n{\"name\": \"getWeather\", \"arguments\": {\"city\": \"SF\"}}\n</tool_call>"
+            )
+            #expect(result.names == ["getWeather"])
+            #expect(result.arguments == ["{\"city\":\"SF\"}"])
+            #expect(result.visible == "")
+        }
+
+        @Test func hermesToolCallKeepsSurroundingProse() {
+            let result = split(
+                "Let me check.\n<tool_call>{\"name\":\"getWeather\",\"arguments\":{\"city\":\"SF\"}}</tool_call>"
+            )
+            #expect(result.names == ["getWeather"])
+            #expect(result.visible == "Let me check.")
+        }
+
+        @Test func multipleHermesToolCalls() {
+            let result = split(
+                "<tool_call>{\"name\":\"getWeather\",\"arguments\":{\"city\":\"SF\"}}</tool_call>"
+                    + "<tool_call>{\"name\":\"getWeather\",\"arguments\":{\"city\":\"NY\"}}</tool_call>"
+            )
+            #expect(result.names == ["getWeather", "getWeather"])
+            #expect(result.arguments == ["{\"city\":\"SF\"}", "{\"city\":\"NY\"}"])
+            #expect(result.visible == "")
+        }
+
+        @Test func llamaPythonTagToolCall() {
+            let result = split("<|python_tag|>{\"name\": \"getWeather\", \"parameters\": {\"city\": \"SF\"}}")
+            #expect(result.names == ["getWeather"])
+            #expect(result.arguments == ["{\"city\":\"SF\"}"])
+            #expect(result.visible == "")
+        }
+
+        @Test func llamaPythonTagSemicolonSeparatedCalls() {
+            let result = split(
+                "<|python_tag|>{\"name\":\"getWeather\",\"parameters\":{\"city\":\"SF\"}}; "
+                    + "{\"name\":\"getWeather\",\"parameters\":{\"city\":\"NY\"}}<|eom_id|>"
+            )
+            #expect(result.names == ["getWeather", "getWeather"])
+            #expect(result.arguments == ["{\"city\":\"SF\"}", "{\"city\":\"NY\"}"])
+            #expect(result.visible == "")
+        }
+
+        @Test func mistralToolCallsArray() {
+            let result = split("[TOOL_CALLS] [{\"name\": \"getWeather\", \"arguments\": {\"city\": \"SF\"}}]")
+            #expect(result.names == ["getWeather"])
+            #expect(result.arguments == ["{\"city\":\"SF\"}"])
+            #expect(result.visible == "")
+        }
+
+        @Test func functionEqualsToolCall() {
+            // Here the JSON payload *is* the arguments; the name comes from the tag.
+            let result = split("<function=getWeather>{\"city\": \"SF\"}</function>")
+            #expect(result.names == ["getWeather"])
+            #expect(result.arguments == ["{\"city\":\"SF\"}"])
+            #expect(result.visible == "")
+        }
+
+        // MARK: Argument shapes
+
+        @Test func bracesInsideStringLiteralsDoNotTerminateScan() {
+            let result = split("<tool_call>{\"name\":\"getWeather\",\"arguments\":{\"city\":\"a}b\"}}</tool_call>")
+            #expect(result.names == ["getWeather"])
+            #expect(result.arguments == ["{\"city\":\"a}b\"}"])
+            #expect(result.visible == "")
+        }
+
+        @Test func openAIStyleFunctionNesting() {
+            let result = split(
+                "<tool_call>{\"type\":\"function\",\"function\":"
+                    + "{\"name\":\"getWeather\",\"arguments\":{\"city\":\"SF\"}}}</tool_call>"
+            )
+            #expect(result.names == ["getWeather"])
+            #expect(result.arguments == ["{\"city\":\"SF\"}"])
+        }
+
+        @Test func stringifiedArguments() {
+            let result = split(
+                "<tool_call>{\"name\":\"getWeather\",\"arguments\":\"{\\\"city\\\":\\\"SF\\\"}\"}</tool_call>"
+            )
+            #expect(result.names == ["getWeather"])
+            #expect(result.arguments == ["{\"city\":\"SF\"}"])
+        }
+
+        // MARK: Negative cases
+
+        @Test func bareJSONIsAToolCallWhenNameIsRegistered() {
+            let result = split("{\"name\": \"getWeather\", \"parameters\": {\"city\": \"SF\"}}")
+            #expect(result.names == ["getWeather"])
+            #expect(result.arguments == ["{\"city\":\"SF\"}"])
+            #expect(result.visible == "")
+        }
+
+        @Test func bareJSONStaysTextWhenNameIsNotRegistered() {
+            // An ordinary JSON answer must not be swallowed as a tool call.
+            let text = "{\"name\": \"other\", \"parameters\": {}}"
+            let result = split(text)
+            #expect(result.names.isEmpty)
+            #expect(result.visible == text)
+        }
+
+        @Test func plainProseIsUntouched() {
+            let result = split("The weather is sunny.")
+            #expect(result.names.isEmpty)
+            #expect(result.visible == "The weather is sunny.")
+        }
+
+        @Test func markerWithoutDecodablePayloadYieldsNoCalls() {
+            // The stray marker is dropped rather than surfaced, and no call is invented.
+            let result = split("<tool_call> oops")
+            #expect(result.names.isEmpty)
+            #expect(result.visible == "oops")
+        }
+
+        // MARK: Streaming holdback
+
+        @Test func streamingEmitsPlainTextImmediately() {
+            #expect(llamaStreamableVisiblePrefix(of: "Hello there") == "Hello there")
+        }
+
+        @Test func streamingWithholdsPartialMarker() {
+            #expect(llamaStreamableVisiblePrefix(of: "Hello <tool_c") == "Hello ")
+        }
+
+        @Test func streamingCutsAtCompleteMarker() {
+            #expect(llamaStreamableVisiblePrefix(of: "Hello <tool_call>{\"x\":1}") == "Hello ")
+        }
+
+        @Test func streamingWithholdsPartialPythonTag() {
+            #expect(llamaStreamableVisiblePrefix(of: "Sure <|python_") == "Sure ")
+        }
+
+        @Test func streamingWithholdsLeadingJSON() {
+            // A bare-JSON tool call is unrecognizable until generation finishes.
+            #expect(llamaStreamableVisiblePrefix(of: "{\"name\":") == "")
+        }
+
+        @Test func streamingWithholdsLeadingJSONAfterWhitespace() {
+            #expect(llamaStreamableVisiblePrefix(of: "  \n{\"na") == "")
+        }
+
+        @Test func streamingWithholdsLeadingBracket() {
+            #expect(llamaStreamableVisiblePrefix(of: "[TOOL_C") == "")
+        }
+
+        @Test func streamingDoesNotTreatLoneAngleBracketAsMarker() {
+            #expect(llamaStreamableVisiblePrefix(of: "5 < 3 is false") == "5 < 3 is false")
+        }
+    }
 #endif  // Llama
