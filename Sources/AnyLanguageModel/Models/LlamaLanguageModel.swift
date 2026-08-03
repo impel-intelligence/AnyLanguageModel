@@ -505,32 +505,113 @@ import Foundation
             llama_set_warmup(context, false)
             llama_set_n_threads(context, runtimeOptions.threads, runtimeOptions.threads)
 
-            let fullPrompt: String
-            if includeSchemaInPrompt, type != String.self {
-                fullPrompt = try formatPrompt(
-                    for: session,
-                    extraSystemMessage: schemaPrompt(for: type.generationSchema)
-                )
-            } else {
-                fullPrompt = try formatPrompt(for: session)
-            }
-
             if type == String.self {
                 let maxTokens = runtimeOptions.maximumResponseTokens ?? 100
-                let text = try await generateText(
-                    context: context,
-                    model: model!,
-                    prompt: fullPrompt,
-                    maxTokens: maxTokens,
-                    options: runtimeOptions
-                )
+                let knownToolNames = Set(session.tools.map(\.name))
 
+                // Tools are advertised through a synthesized system message because the binding
+                // cannot pass them to the chat template. See `toolInstructionMessage(for:)`.
+                var messages = chatMessages(for: session)
+                if let instruction = toolInstructionMessage(for: session) {
+                    messages = mergingToolInstruction(instruction, into: messages)
+                }
+
+                var transcriptEntries: [Transcript.Entry] = []
+                var visibleChunks: [String] = []
+                var toolIteration = 0
+                var previousToolCallSignature: String?
+
+                while true {
+                    try Task.checkCancellation()
+
+                    if toolIteration > 0, let memory = llama_get_memory(context) {
+                        // Each iteration re-decodes the whole prompt from position 0, so the KV
+                        // cache from the previous iteration has to be dropped first.
+                        llama_memory_clear(memory, true)
+                    }
+
+                    let iterationPrompt = try renderPrompt(messages)
+                    let rawText = try await generateText(
+                        context: context,
+                        model: model!,
+                        prompt: iterationPrompt,
+                        maxTokens: maxTokens,
+                        options: runtimeOptions
+                    )
+
+                    let split = llamaSplitToolCalls(from: rawText, knownToolNames: knownToolNames)
+                    if !split.visibleText.isEmpty {
+                        visibleChunks.append(split.visibleText)
+                    }
+
+                    guard !split.toolCalls.isEmpty else { break }
+
+                    toolIteration += 1
+                    if toolIteration > Self.maximumToolIterations {
+                        transcriptEntries.append(
+                            .toolCalls(Transcript.ToolCalls(makeTranscriptToolCalls(from: split.toolCalls)))
+                        )
+                        throw Self.maxToolIterationsExceededError(limit: Self.maximumToolIterations)
+                    }
+
+                    let signature = Self.toolCallSignature(for: split.toolCalls)
+                    if signature == previousToolCallSignature {
+                        transcriptEntries.append(
+                            .toolCalls(Transcript.ToolCalls(makeTranscriptToolCalls(from: split.toolCalls)))
+                        )
+                        throw Self.repeatedToolCallLoopError()
+                    }
+                    previousToolCallSignature = signature
+
+                    // Replay the model's own turn verbatim so it sees the calls it just made.
+                    messages.append(("assistant", rawText))
+
+                    switch try await resolveToolCalls(split.toolCalls, session: session) {
+                    case .stop(let calls):
+                        if !calls.isEmpty {
+                            transcriptEntries.append(.toolCalls(Transcript.ToolCalls(calls)))
+                        }
+                        let stoppedText = visibleChunks.joined(separator: "\n")
+                        return LanguageModelSession.Response(
+                            content: stoppedText as! Content,
+                            rawContent: GeneratedContent(stoppedText),
+                            transcriptEntries: ArraySlice(transcriptEntries)
+                        )
+
+                    case .invocations(let invocations):
+                        guard !invocations.isEmpty else { break }
+
+                        transcriptEntries.append(
+                            .toolCalls(Transcript.ToolCalls(invocations.map(\.call)))
+                        )
+                        for invocation in invocations {
+                            transcriptEntries.append(.toolOutput(invocation.output))
+                        }
+                        messages.append(
+                            (
+                                "user",
+                                invocations.map { toolResponseMarkup($0.output) }.joined(separator: "\n")
+                            )
+                        )
+                        messages = mergingConsecutiveRoles(messages)
+                        continue
+                    }
+
+                    break
+                }
+
+                let text = visibleChunks.joined(separator: "\n")
                 return LanguageModelSession.Response(
                     content: text as! Content,
                     rawContent: GeneratedContent(text),
-                    transcriptEntries: ArraySlice([])
+                    transcriptEntries: ArraySlice(transcriptEntries)
                 )
             } else {
+                let fullPrompt =
+                    includeSchemaInPrompt
+                    ? try formatPrompt(for: session, extraSystemMessage: schemaPrompt(for: type.generationSchema))
+                    : try formatPrompt(for: session)
+
                 let maxTokens = structuredOptions.maximumResponseTokens ?? 512
                 let jsonString = try await generateStructuredJSON(
                     context: context,
@@ -599,28 +680,143 @@ import Foundation
                             llama_set_warmup(context, false)
                             llama_set_n_threads(context, runtimeOptions.threads, runtimeOptions.threads)
 
-                            var accumulatedText = ""
-                            let fullPrompt = try self.formatPrompt(for: session)
+                            let knownToolNames = Set(session.tools.map(\.name))
+                            let hasTools = !knownToolNames.isEmpty
 
-                            do {
+                            // Snapshot the prompt messages before generating: the transcript is
+                            // mutated during the stream, and in-flight turns are tracked here
+                            // instead so they are never counted twice.
+                            var messages = self.chatMessages(for: session)
+                            if let instruction = self.toolInstructionMessage(for: session) {
+                                messages = self.mergingToolInstruction(instruction, into: messages)
+                            }
+
+                            // Text emitted across all completed tool iterations.
+                            var emittedText = ""
+                            var toolIteration = 0
+                            var previousToolCallSignature: String?
+
+                            func yieldText(_ text: String) {
+                                session.growStreamingTranscript(text: text)
+                                continuation.yield(
+                                    LanguageModelSession.ResponseStream<Content>.Snapshot(
+                                        content: (text as! Content).asPartiallyGenerated(),
+                                        rawContent: GeneratedContent(text)
+                                    )
+                                )
+                            }
+
+                            while true {
+                                try Task.checkCancellation()
+
+                                if toolIteration > 0, let memory = llama_get_memory(context) {
+                                    // Drop the previous iteration's KV cache before re-decoding
+                                    // the extended prompt from position 0.
+                                    llama_memory_clear(memory, true)
+                                }
+
+                                let iterationPrompt = try self.renderPrompt(messages)
+                                var rawText = ""
+                                var lastVisible = ""
+
                                 for try await tokenText in generateTextStream(
                                     context: context,
                                     model: model!,
-                                    prompt: fullPrompt,
+                                    prompt: iterationPrompt,
                                     maxTokens: maxTokens,
                                     options: runtimeOptions
                                 ) {
-                                    accumulatedText += tokenText
+                                    if Task.isCancelled { break }
+                                    rawText += tokenText
 
-                                    let snapshot = LanguageModelSession.ResponseStream<Content>.Snapshot(
-                                        content: (accumulatedText as! Content).asPartiallyGenerated(),
-                                        rawContent: GeneratedContent(accumulatedText)
-                                    )
-                                    continuation.yield(snapshot)
+                                    // Withhold anything that has begun, or might still become,
+                                    // tool-call markup.
+                                    let visible =
+                                        hasTools
+                                        ? llamaStreamableVisiblePrefix(of: rawText)
+                                        : rawText
+                                    guard visible != lastVisible else { continue }
+                                    lastVisible = visible
+                                    yieldText(emittedText + visible)
                                 }
-                            } catch {
-                                continuation.finish(throwing: error)
-                                return
+
+                                let split = llamaSplitToolCalls(
+                                    from: rawText,
+                                    knownToolNames: knownToolNames
+                                )
+
+                                // Flush the final text for this iteration now that the full
+                                // response is known and tool markup can be stripped exactly.
+                                if split.visibleText != lastVisible {
+                                    yieldText(emittedText + split.visibleText)
+                                }
+                                emittedText += split.visibleText
+
+                                guard !split.toolCalls.isEmpty else { break }
+
+                                toolIteration += 1
+                                if toolIteration > Self.maximumToolIterations {
+                                    session.appendTranscriptEntry(
+                                        .toolCalls(
+                                            Transcript.ToolCalls(
+                                                makeTranscriptToolCalls(from: split.toolCalls)
+                                            )
+                                        )
+                                    )
+                                    throw Self.maxToolIterationsExceededError(
+                                        limit: Self.maximumToolIterations
+                                    )
+                                }
+
+                                let signature = Self.toolCallSignature(for: split.toolCalls)
+                                if signature == previousToolCallSignature {
+                                    session.appendTranscriptEntry(
+                                        .toolCalls(
+                                            Transcript.ToolCalls(
+                                                makeTranscriptToolCalls(from: split.toolCalls)
+                                            )
+                                        )
+                                    )
+                                    throw Self.repeatedToolCallLoopError()
+                                }
+                                previousToolCallSignature = signature
+
+                                // Replay the model's own turn verbatim.
+                                messages.append(("assistant", rawText))
+
+                                switch try await resolveToolCalls(split.toolCalls, session: session) {
+                                case .stop(let calls):
+                                    // Record the calls, then end the stream without executing them.
+                                    if !calls.isEmpty {
+                                        session.appendTranscriptEntry(.toolCalls(Transcript.ToolCalls(calls)))
+                                    }
+                                    continuation.finish()
+                                    return
+
+                                case .invocations(let invocations):
+                                    guard !invocations.isEmpty else { break }
+
+                                    // Tool calls must land in the transcript before their outputs.
+                                    session.appendTranscriptEntry(
+                                        .toolCalls(Transcript.ToolCalls(invocations.map(\.call)))
+                                    )
+                                    for invocation in invocations {
+                                        session.appendTranscriptEntry(.toolOutput(invocation.output))
+                                    }
+
+                                    messages.append(
+                                        (
+                                            "user",
+                                            invocations
+                                                .map { self.toolResponseMarkup($0.output) }
+                                                .joined(separator: "\n")
+                                        )
+                                    )
+                                    messages = self.mergingConsecutiveRoles(messages)
+                                    continue
+                                }
+
+                                break
                             }
 
                             continuation.finish()
@@ -1370,10 +1566,20 @@ import Foundation
             for session: LanguageModelSession,
             extraSystemMessage: String? = nil
         ) throws -> String {
-            guard let model = self.model else {
-                throw LlamaLanguageModelError.modelLoadFailed
-            }
+            try renderPrompt(chatMessages(for: session, extraSystemMessage: extraSystemMessage))
+        }
 
+        /// Flattens the session transcript into role/content pairs for the chat template.
+        ///
+        /// Tool activity is rendered back into the text formats this provider emits and parses,
+        /// so that a follow-up turn on a session that already used tools sees a coherent history.
+        /// Tool results are replayed with the `user` role rather than a `tool` role because
+        /// `llama_chat_apply_template` only implements a fixed set of built-in templates, and
+        /// several of them (Llama 2, Mistral) do not recognize a `tool` role at all.
+        private func chatMessages(
+            for session: LanguageModelSession,
+            extraSystemMessage: String? = nil
+        ) -> [(role: String, content: String)] {
             var messages: [(role: String, content: String)] = []
 
             for entry in session.transcript {
@@ -1396,13 +1602,46 @@ import Foundation
                         messages.append(("assistant", text))
                     }
 
-                default:
-                    break
+                case .toolCalls(let toolCalls):
+                    let markup = toolCallMarkup(Array(toolCalls))
+                    if !markup.isEmpty {
+                        messages.append(("assistant", markup))
+                    }
+
+                case .toolOutput(let output):
+                    messages.append(("user", toolResponseMarkup(output)))
                 }
             }
 
             if let extraSystemMessage, !extraSystemMessage.isEmpty {
                 messages.append(("system", extraSystemMessage))
+            }
+
+            return mergingConsecutiveRoles(messages)
+        }
+
+        /// Collapses runs of same-role messages into one.
+        ///
+        /// Several built-in llama.cpp templates assume strictly alternating user/assistant turns,
+        /// and a run of consecutive tool-result messages would otherwise break them.
+        private func mergingConsecutiveRoles(
+            _ messages: [(role: String, content: String)]
+        ) -> [(role: String, content: String)] {
+            var merged: [(role: String, content: String)] = []
+            for message in messages {
+                if var last = merged.last, last.role == message.role {
+                    last.content += "\n" + message.content
+                    merged[merged.count - 1] = last
+                } else {
+                    merged.append(message)
+                }
+            }
+            return merged
+        }
+
+        private func renderPrompt(_ messages: [(role: String, content: String)]) throws -> String {
+            guard let model = self.model else {
+                throw LlamaLanguageModelError.modelLoadFailed
             }
 
             // Keep C strings alive while using them
@@ -1455,6 +1694,144 @@ import Foundation
             return buffer.withUnsafeBytes { rawBuffer in
                 String(decoding: rawBuffer.prefix(Int(result)), as: UTF8.self)
             }
+        }
+
+        // MARK: - Tool Prompting
+
+        /// The maximum number of tool round-trips allowed in a single response.
+        private static let maximumToolIterations = 8
+
+        private static func maxToolIterationsExceededError(limit: Int) -> LanguageModelSession.GenerationError {
+            .decodingFailure(
+                .init(
+                    debugDescription:
+                        "Exceeded maximum tool iterations (\(limit)) while processing Llama tool calls."
+                )
+            )
+        }
+
+        private static func repeatedToolCallLoopError() -> LanguageModelSession.GenerationError {
+            .decodingFailure(
+                .init(
+                    debugDescription:
+                        "Detected repeated Llama tool-call signature and aborted to avoid an infinite tool loop."
+                )
+            )
+        }
+
+        /// A stable fingerprint of a batch of tool calls, used to detect a stuck model.
+        private static func toolCallSignature(for calls: [ParsedLlamaToolCall]) -> String {
+            calls.map { "\($0.name):\($0.arguments.jsonString)" }.joined(separator: "|")
+        }
+
+        /// Places the tool instructions in the leading system message.
+        ///
+        /// Appending a trailing system message (the way schema prompts are handled) would break the
+        /// strict user/assistant alternation that several built-in llama.cpp templates require.
+        private func mergingToolInstruction(
+            _ instruction: String,
+            into messages: [(role: String, content: String)]
+        ) -> [(role: String, content: String)] {
+            var messages = messages
+            if let first = messages.first, first.role == "system" {
+                messages[0] = ("system", first.content + "\n\n" + instruction)
+            } else {
+                messages.insert(("system", instruction), at: 0)
+            }
+            return messages
+        }
+
+        /// Builds the system message that advertises the session's tools to the model.
+        ///
+        /// - Important: `llama.h` exposes no tool API. `llama_chat_message` carries only a role and
+        ///   a content string, and `llama_chat_apply_template` explicitly "does not use a jinja
+        ///   parser" — it sniffs the GGUF template string to pick one of a fixed set of built-in
+        ///   C++ templates, none of which accept tool definitions. The tool-aware renderer
+        ///   (`common_chat_templates_apply`) lives in llama.cpp's `common` library, which is not
+        ///   part of the `llama` xcframework that LlamaSwift re-exports.
+        ///
+        ///   So tools cannot be injected through the model's own chat template here. Instead we
+        ///   describe them in a system message and ask for the Hermes/Qwen `<tool_call>` format,
+        ///   which is the most widely trained-on text convention across GGUF chat models. Parsing
+        ///   is more permissive than emission: see ``llamaSplitToolCalls(from:knownToolNames:)``.
+        private func toolInstructionMessage(for session: LanguageModelSession) -> String? {
+            guard !session.tools.isEmpty else { return nil }
+
+            var specs: [String] = []
+            for tool in session.tools {
+                let resolvedSchema = tool.parameters.withResolvedRoot() ?? tool.parameters
+                guard
+                    let schemaData = try? JSONEncoder().encode(resolvedSchema),
+                    let schemaObject = try? JSONSerialization.jsonObject(with: schemaData)
+                else { continue }
+
+                let spec: [String: Any] = [
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": schemaObject,
+                ]
+                guard
+                    let specData = try? JSONSerialization.data(withJSONObject: spec, options: [.sortedKeys]),
+                    let specString = String(data: specData, encoding: .utf8)
+                else { continue }
+
+                specs.append(specString)
+            }
+
+            guard !specs.isEmpty else { return nil }
+
+            return """
+                You have access to the following tools. Each is described by a JSON object with a \
+                name, a description, and a JSON Schema for its arguments.
+
+                \(specs.joined(separator: "\n"))
+
+                To call a tool, reply with nothing but one or more blocks in exactly this form:
+
+                <tool_call>
+                {"name": "<tool name>", "arguments": {<arguments matching that tool's schema>}}
+                </tool_call>
+
+                Results come back as <tool_response> blocks. Once you have the results you need, \
+                answer the user in plain text and do not emit any more tool calls. If no tool is \
+                needed, just answer in plain text.
+                """
+        }
+
+        /// Renders transcript tool calls back into the `<tool_call>` text form the model emits.
+        private func toolCallMarkup(_ calls: [Transcript.ToolCall]) -> String {
+            calls.map { call in
+                "<tool_call>\n{\"name\": \"\(call.toolName)\", \"arguments\": \(call.arguments.jsonString)}\n</tool_call>"
+            }
+            .joined(separator: "\n")
+        }
+
+        /// Renders a tool output into the `<tool_response>` text form fed back to the model.
+        private func toolResponseMarkup(_ output: Transcript.ToolOutput) -> String {
+            let text = toolOutputText(output)
+            let payload =
+                (try? JSONSerialization.data(
+                    withJSONObject: ["name": output.toolName, "content": text],
+                    options: [.sortedKeys]
+                ))
+                .flatMap { String(data: $0, encoding: .utf8) }
+                ?? "{\"name\": \"\(output.toolName)\"}"
+            return "<tool_response>\n\(payload)\n</tool_response>"
+        }
+
+        private func toolOutputText(_ output: Transcript.ToolOutput) -> String {
+            output.segments.compactMap { segment -> String? in
+                switch segment {
+                case .text(let text):
+                    return text.content
+                case .structure(let structured):
+                    return structured.content.jsonString
+                case .image:
+                    // Image tool output has no textual form to feed back through the chat template.
+                    return nil
+                }
+            }
+            .joined(separator: "\n")
         }
 
         private func extractText(from segments: [Transcript.Segment]) -> String {
@@ -1526,6 +1903,371 @@ import Foundation
             let bytes = UnsafeBufferPointer(start: u8Ptr, count: count)
             return String(decoding: bytes, as: UTF8.self)
         }
+    }
+
+    // MARK: - Tool Call Parsing
+
+    /// A tool call recovered from the model's generated text.
+    private struct ParsedLlamaToolCall {
+        let name: String
+        let arguments: GeneratedContent
+    }
+
+    /// Opening markers for every tool-call text format this provider recognizes.
+    ///
+    /// Local GGUF models express tool calls as generated text in a family-specific format, and the
+    /// binding gives us no structured tool channel to read instead. This list is the explicit,
+    /// deliberately narrow scope of what is supported:
+    ///
+    /// - `<tool_call>{...}</tool_call>` — Hermes / Qwen / ChatML-with-tools. This is also the
+    ///   format we ask for in the system message, so it is the primary path.
+    /// - `<|python_tag|>{...}` — Llama 3.1 / 3.2, including `;`-separated multi-calls.
+    /// - `[TOOL_CALLS] [{...}]` — Mistral / Mixtral.
+    /// - `<function=name>{...}</function>` — Llama 3.2 functionary-style.
+    ///
+    /// A bare leading JSON object is also accepted, but only when its name matches a registered
+    /// tool (see ``llamaSplitToolCalls(from:knownToolNames:)``).
+    ///
+    /// Any other family-specific syntax is *not* supported and its text will be returned to the
+    /// caller as ordinary model output.
+    private let llamaToolCallMarkers = ["<tool_call>", "<|python_tag|>", "[TOOL_CALLS]", "<function="]
+
+    /// Returns the range of the balanced JSON container starting at or after `start`.
+    ///
+    /// Brace matching is string- and escape-aware so that braces inside string literals do not
+    /// terminate the scan early.
+    private func llamaBalancedJSONRange(in text: String, from start: String.Index) -> Range<String.Index>? {
+        var index = start
+        while index < text.endIndex, text[index].isWhitespace {
+            index = text.index(after: index)
+        }
+        guard index < text.endIndex else { return nil }
+
+        let opening = text[index]
+        let closing: Character
+        switch opening {
+        case "{": closing = "}"
+        case "[": closing = "]"
+        default: return nil
+        }
+
+        let begin = index
+        var depth = 0
+        var inString = false
+        var escaped = false
+
+        while index < text.endIndex {
+            let character = text[index]
+            if escaped {
+                escaped = false
+            } else if inString {
+                if character == "\\" {
+                    escaped = true
+                } else if character == "\"" {
+                    inString = false
+                }
+            } else if character == "\"" {
+                inString = true
+            } else if character == opening {
+                depth += 1
+            } else if character == closing {
+                depth -= 1
+                if depth == 0 {
+                    return begin ..< text.index(after: index)
+                }
+            }
+            index = text.index(after: index)
+        }
+
+        return nil
+    }
+
+    /// Decodes one tool call from a already-parsed JSON value.
+    private func llamaToolCall(fromObject object: Any, defaultName: String? = nil) -> ParsedLlamaToolCall? {
+        guard var dictionary = object as? [String: Any] else { return nil }
+
+        // OpenAI-shaped nesting: {"type": "function", "function": {"name": ..., "arguments": ...}}
+        if let function = dictionary["function"] as? [String: Any] {
+            dictionary = function
+        }
+
+        guard let name = (dictionary["name"] as? String) ?? defaultName, !name.isEmpty else { return nil }
+
+        // Families disagree on the argument key, and some emit the payload as a JSON *string*.
+        let rawArguments = dictionary["arguments"] ?? dictionary["parameters"] ?? [String: Any]()
+        let argumentsJSON: String
+        if let string = rawArguments as? String {
+            argumentsJSON = string.isEmpty ? "{}" : string
+        } else if let data = try? JSONSerialization.data(withJSONObject: rawArguments, options: [.sortedKeys]),
+            let string = String(data: data, encoding: .utf8)
+        {
+            argumentsJSON = string
+        } else {
+            return nil
+        }
+
+        guard let arguments = try? GeneratedContent(json: argumentsJSON) else { return nil }
+        return ParsedLlamaToolCall(name: name, arguments: arguments)
+    }
+
+    /// Decodes one or more tool calls from a JSON object or array.
+    private func llamaToolCalls(fromJSON json: String, defaultName: String? = nil) -> [ParsedLlamaToolCall] {
+        guard let object = try? JSONSerialization.jsonObject(with: Data(json.utf8)) else { return [] }
+        if let array = object as? [Any] {
+            return array.compactMap { llamaToolCall(fromObject: $0, defaultName: defaultName) }
+        }
+        return [llamaToolCall(fromObject: object, defaultName: defaultName)].compactMap { $0 }
+    }
+
+    /// Splits generated text into the prose a caller should see and the tool calls embedded in it.
+    ///
+    /// See ``llamaToolCallMarkers`` for the exact set of supported formats.
+    private func llamaSplitToolCalls(
+        from text: String,
+        knownToolNames: Set<String>
+    ) -> (visibleText: String, toolCalls: [ParsedLlamaToolCall]) {
+        var calls: [ParsedLlamaToolCall] = []
+        var visible = ""
+        var cursor = text.startIndex
+
+        while cursor < text.endIndex {
+            // Find the earliest marker at or after the cursor.
+            var found: (range: Range<String.Index>, marker: String)?
+            for marker in llamaToolCallMarkers {
+                guard let range = text.range(of: marker, range: cursor ..< text.endIndex) else { continue }
+                if found == nil || range.lowerBound < found!.range.lowerBound {
+                    found = (range, marker)
+                }
+            }
+
+            guard let match = found else {
+                visible += text[cursor...]
+                break
+            }
+
+            visible += text[cursor ..< match.range.lowerBound]
+            var next = match.range.upperBound
+
+            switch match.marker {
+            case "<function=":
+                // <function=NAME>{arguments}</function> — the payload is the arguments themselves.
+                guard let nameEnd = text.range(of: ">", range: next ..< text.endIndex) else {
+                    cursor = next
+                    continue
+                }
+                let name = String(text[next ..< nameEnd.lowerBound])
+                guard
+                    !name.isEmpty,
+                    let jsonRange = llamaBalancedJSONRange(in: text, from: nameEnd.upperBound)
+                else {
+                    cursor = nameEnd.upperBound
+                    continue
+                }
+                if let arguments = try? GeneratedContent(json: String(text[jsonRange])) {
+                    calls.append(ParsedLlamaToolCall(name: name, arguments: arguments))
+                }
+                next = jsonRange.upperBound
+                next = llamaConsuming("</function>", in: text, from: next)
+
+            case "<tool_call>":
+                guard let jsonRange = llamaBalancedJSONRange(in: text, from: next) else {
+                    cursor = next
+                    continue
+                }
+                calls.append(contentsOf: llamaToolCalls(fromJSON: String(text[jsonRange])))
+                next = jsonRange.upperBound
+                next = llamaConsuming("</tool_call>", in: text, from: next)
+
+            default:
+                // <|python_tag|> and [TOOL_CALLS]: one or more payloads, optionally ";"-separated.
+                var scan = next
+                while let jsonRange = llamaBalancedJSONRange(in: text, from: scan) {
+                    calls.append(contentsOf: llamaToolCalls(fromJSON: String(text[jsonRange])))
+                    scan = jsonRange.upperBound
+
+                    var probe = scan
+                    while probe < text.endIndex, text[probe].isWhitespace {
+                        probe = text.index(after: probe)
+                    }
+                    guard probe < text.endIndex, text[probe] == ";" else { break }
+                    scan = text.index(after: probe)
+                }
+                if scan == next {
+                    // Marker with no decodable payload; treat it as ordinary text and move on.
+                    cursor = next
+                    continue
+                }
+                next = llamaConsuming("<|eom_id|>", in: text, from: scan)
+            }
+
+            cursor = next
+        }
+
+        if calls.isEmpty {
+            // Some templates (notably Llama 3.1/3.2 without <|python_tag|>) emit a bare JSON object.
+            // Only treat that as a tool call when every name matches a registered tool, so that an
+            // ordinary JSON answer is not silently swallowed.
+            if let jsonRange = llamaBalancedJSONRange(in: visible, from: visible.startIndex) {
+                let candidates = llamaToolCalls(fromJSON: String(visible[jsonRange]))
+                if !candidates.isEmpty, candidates.allSatisfy({ knownToolNames.contains($0.name) }) {
+                    var remaining = visible
+                    remaining.removeSubrange(jsonRange)
+                    return (remaining.trimmingCharacters(in: .whitespacesAndNewlines), candidates)
+                }
+            }
+        }
+
+        return (visible.trimmingCharacters(in: .whitespacesAndNewlines), calls)
+    }
+
+    /// Advances past `token` if it is the next non-whitespace content, otherwise returns `index`.
+    private func llamaConsuming(_ token: String, in text: String, from index: String.Index) -> String.Index {
+        var probe = index
+        while probe < text.endIndex, text[probe].isWhitespace {
+            probe = text.index(after: probe)
+        }
+        guard text[probe...].hasPrefix(token) else { return index }
+        return text.index(probe, offsetBy: token.count)
+    }
+
+    /// Returns the portion of a partially generated response that is safe to show a caller.
+    ///
+    /// Tool-call markup arrives inline with prose, so streaming must withhold any text that has
+    /// begun — or might still turn into — a tool call.
+    private func llamaStreamableVisiblePrefix(of text: String) -> String {
+        // A response opening with a JSON container may be a bare-JSON tool call, which cannot be
+        // recognized until generation finishes. Withhold all of it until then.
+        let leading = text.drop(while: { $0.isWhitespace })
+        if leading.first == "{" || leading.first == "[" { return "" }
+
+        var earliest: String.Index?
+        for marker in llamaToolCallMarkers {
+            guard let range = text.range(of: marker) else { continue }
+            if earliest == nil || range.lowerBound < earliest! {
+                earliest = range.lowerBound
+            }
+        }
+        if let earliest { return String(text[..<earliest]) }
+
+        // Withhold a trailing fragment that could still grow into a marker.
+        let longestMarker = llamaToolCallMarkers.map(\.count).max() ?? 1
+        var holdback = min(longestMarker - 1, text.count)
+        while holdback > 0 {
+            let tail = String(text.suffix(holdback))
+            if llamaToolCallMarkers.contains(where: { $0.hasPrefix(tail) }) {
+                return String(text.dropLast(holdback))
+            }
+            holdback -= 1
+        }
+
+        return text
+    }
+
+    // MARK: - Tool Invocation Handling
+
+    private struct LlamaToolInvocationResult {
+        let call: Transcript.ToolCall
+        let output: Transcript.ToolOutput
+    }
+
+    private enum LlamaToolResolutionOutcome {
+        case stop(calls: [Transcript.ToolCall])
+        case invocations([LlamaToolInvocationResult])
+    }
+
+    private func makeTranscriptToolCalls(from parsed: [ParsedLlamaToolCall]) -> [Transcript.ToolCall] {
+        parsed.map {
+            Transcript.ToolCall(id: UUID().uuidString, toolName: $0.name, arguments: $0.arguments)
+        }
+    }
+
+    /// Runs the session's tool-execution delegate protocol over a batch of parsed tool calls.
+    ///
+    /// - Note: This mirrors the `resolveToolCalls` / `resolveToolUses` functions that each other
+    ///   provider keeps file-private in its own file. It is duplicated rather than shared because
+    ///   those are `private` and this task may not introduce a shared abstraction.
+    private func resolveToolCalls(
+        _ parsedCalls: [ParsedLlamaToolCall],
+        session: LanguageModelSession
+    ) async throws -> LlamaToolResolutionOutcome {
+        if parsedCalls.isEmpty { return .invocations([]) }
+
+        var toolsByName: [String: any Tool] = [:]
+        for tool in session.tools where toolsByName[tool.name] == nil {
+            toolsByName[tool.name] = tool
+        }
+
+        let transcriptCalls = makeTranscriptToolCalls(from: parsedCalls)
+
+        if let delegate = session.toolExecutionDelegate {
+            await delegate.didGenerateToolCalls(transcriptCalls, in: session)
+        }
+
+        guard !transcriptCalls.isEmpty else { return .invocations([]) }
+
+        var decisions: [ToolExecutionDecision] = []
+        decisions.reserveCapacity(transcriptCalls.count)
+
+        if let delegate = session.toolExecutionDelegate {
+            for call in transcriptCalls {
+                let decision = await delegate.toolCallDecision(for: call, in: session)
+                if case .stop = decision {
+                    return .stop(calls: transcriptCalls)
+                }
+                decisions.append(decision)
+            }
+        } else {
+            decisions = Array(repeating: .execute, count: transcriptCalls.count)
+        }
+
+        var results: [LlamaToolInvocationResult] = []
+        results.reserveCapacity(transcriptCalls.count)
+
+        for (index, call) in transcriptCalls.enumerated() {
+            switch decisions[index] {
+            case .stop:
+                // Unreachable: `.stop` returns while decisions are collected. Defensive only.
+                return .stop(calls: transcriptCalls)
+
+            case .provideOutput(let segments):
+                let output = Transcript.ToolOutput(id: call.id, toolName: call.toolName, segments: segments)
+                if let delegate = session.toolExecutionDelegate {
+                    await delegate.didExecuteToolCall(call, output: output, in: session)
+                }
+                results.append(LlamaToolInvocationResult(call: call, output: output))
+
+            case .execute:
+                guard let tool = toolsByName[call.toolName] else {
+                    let message = Transcript.Segment.text(.init(content: "Tool not found: \(call.toolName)"))
+                    let output = Transcript.ToolOutput(
+                        id: call.id,
+                        toolName: call.toolName,
+                        segments: [message]
+                    )
+                    if let delegate = session.toolExecutionDelegate {
+                        await delegate.didExecuteToolCall(call, output: output, in: session)
+                    }
+                    results.append(LlamaToolInvocationResult(call: call, output: output))
+                    continue
+                }
+
+                do {
+                    let segments = try await tool.makeOutputSegments(from: call.arguments)
+                    let output = Transcript.ToolOutput(id: call.id, toolName: tool.name, segments: segments)
+                    if let delegate = session.toolExecutionDelegate {
+                        await delegate.didExecuteToolCall(call, output: output, in: session)
+                    }
+                    results.append(LlamaToolInvocationResult(call: call, output: output))
+                } catch {
+                    if let delegate = session.toolExecutionDelegate {
+                        await delegate.didFailToolCall(call, error: error, in: session)
+                    }
+                    throw LanguageModelSession.ToolCallError(tool: tool, underlyingError: error)
+                }
+            }
+        }
+
+        return .invocations(results)
     }
 
     /// Errors that can occur when using LlamaLanguageModel
