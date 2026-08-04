@@ -415,6 +415,9 @@ import Foundation
         /// The loaded model instance
         private var model: OpaquePointer?
 
+        /// Memoized result of probing the chat template for `tool` role support.
+        private var cachedToolResultRole: String?
+
         /// The model's vocabulary
         private var vocab: OpaquePointer?
 
@@ -1668,9 +1671,8 @@ import Foundation
         ///
         /// Tool activity is rendered back into the text formats this provider emits and parses,
         /// so that a follow-up turn on a session that already used tools sees a coherent history.
-        /// Tool results are replayed with the `user` role rather than a `tool` role because
-        /// `llama_chat_apply_template` only implements a fixed set of built-in templates, and
-        /// several of them (Llama 2, Mistral) do not recognize a `tool` role at all.
+        /// Tool results are replayed under whichever role the model's template understands —
+        /// see ``toolResultRole``.
         private func chatMessages(
             for session: LanguageModelSession,
             extraSystemMessage: String? = nil
@@ -1704,7 +1706,7 @@ import Foundation
                     }
 
                 case .toolOutput(let output):
-                    messages.append(("user", toolResponseMarkup(output)))
+                    messages.append((toolResultRole, toolResponseMarkup(output)))
                 }
             }
 
@@ -1713,6 +1715,35 @@ import Foundation
             }
 
             return mergingConsecutiveRoles(messages)
+        }
+
+        /// The role to replay tool results under.
+        ///
+        /// `llama_chat_apply_template` implements a fixed set of built-in templates. Some of them
+        /// (ChatML, Qwen, Hermes) render a `tool` role explicitly, which is what a tool-trained
+        /// model expects to see; others (Llama 2, Mistral) don't recognize it and fold any
+        /// unknown role into the user turn, where the raw role name would leak into the prompt.
+        ///
+        /// Rather than hardcode which templates support it, this renders the same content under
+        /// both roles and compares: a template that distinguishes them produces different output.
+        private var toolResultRole: String {
+            if let cached = cachedToolResultRole {
+                return cached
+            }
+            let role = templateDistinguishesToolRole() ? "tool" : "user"
+            cachedToolResultRole = role
+            return role
+        }
+
+        private func templateDistinguishesToolRole() -> Bool {
+            let probe = "__tool_role_probe__"
+            guard
+                let asTool = try? renderPrompt([("user", "probe"), ("tool", probe)]),
+                let asUser = try? renderPrompt([("user", "probe"), ("user", probe)])
+            else {
+                return false
+            }
+            return asTool != asUser
         }
 
         /// Collapses runs of same-role messages into one.
