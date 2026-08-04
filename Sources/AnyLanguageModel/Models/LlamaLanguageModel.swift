@@ -706,14 +706,12 @@ import Foundation
                                 )
                             }
 
+                            // Carried across tool iterations so each re-render keeps the prefix it
+                            // shares with the last one instead of decoding the prompt again.
+                            let kvCache = KVCacheState()
+
                             while true {
                                 try Task.checkCancellation()
-
-                                if toolIteration > 0, let memory = llama_get_memory(context) {
-                                    // Drop the previous iteration's KV cache before re-decoding
-                                    // the extended prompt from position 0.
-                                    llama_memory_clear(memory, true)
-                                }
 
                                 let iterationPrompt = try self.renderPrompt(messages)
                                 var rawText = ""
@@ -724,7 +722,8 @@ import Foundation
                                     model: model!,
                                     prompt: iterationPrompt,
                                     maxTokens: maxTokens,
-                                    options: runtimeOptions
+                                    options: runtimeOptions,
+                                    cache: kvCache
                                 ) {
                                     if Task.isCancelled { break }
                                     rawText += tokenText
@@ -1320,12 +1319,86 @@ import Foundation
             }
         }
 
+        /// The tokens currently resident in a context's KV cache.
+        ///
+        /// A tool-calling turn re-renders the whole conversation each iteration, and every
+        /// iteration shares a long prefix with the last one — the instructions, the user's
+        /// prompt, and every earlier turn. Carrying the decoded tokens between iterations lets
+        /// the cache be trimmed back to that shared prefix rather than cleared, so only the
+        /// newly appended messages are decoded.
+        private final class KVCacheState {
+            var tokens: [llama_token] = []
+        }
+
+        /// The number of leading tokens two sequences share.
+        private func commonPrefixLength(_ lhs: [llama_token], _ rhs: [llama_token]) -> Int {
+            var count = 0
+            let limit = min(lhs.count, rhs.count)
+            while count < limit, lhs[count] == rhs[count] {
+                count += 1
+            }
+            return count
+        }
+
+        /// How much of `promptTokens` is already resident and can be left in place, trimming the
+        /// rest of the sequence away.
+        ///
+        /// This mirrors the checks `llama-server` makes before reusing a cached prefix, because
+        /// the same conditions make reuse unsound here:
+        ///
+        /// - Recurrent models (Mamba, RWKV) carry a rolling state rather than per-token entries,
+        ///   so there is no prefix to keep.
+        /// - Encoder models hold state that these tokens don't describe.
+        /// - A sliding-window cache evicts the head of the sequence, so a non-zero `pos_min`
+        ///   means position 0 is already gone and the prefix can't be trusted.
+        /// - `llama_memory_seq_rm` reports `false` when a partial removal isn't supported, in
+        ///   which case the whole sequence has to go.
+        ///
+        /// Returns the number of leading tokens left resident; the caller decodes from there.
+        private func reusableCachePrefix(
+            cache: KVCacheState?,
+            promptTokens: [llama_token],
+            model: OpaquePointer,
+            context: OpaquePointer
+        ) -> Int {
+            guard let memory = llama_get_memory(context) else { return 0 }
+
+            func discardEverything() -> Int {
+                llama_memory_seq_rm(memory, 0, -1, -1)
+                cache?.tokens.removeAll()
+                return 0
+            }
+
+            guard let cache, !cache.tokens.isEmpty else { return discardEverything() }
+            guard !llama_model_is_recurrent(model), !llama_model_has_encoder(model) else {
+                return discardEverything()
+            }
+
+            // A sliding-window cache that has already evicted the head can't anchor a prefix.
+            guard llama_memory_seq_pos_min(memory, 0) == 0 else { return discardEverything() }
+
+            // Re-decode at least one token so the batch produces logits to sample from.
+            let shared = min(
+                commonPrefixLength(cache.tokens, promptTokens),
+                promptTokens.count - 1
+            )
+            guard shared > 0 else { return discardEverything() }
+
+            guard llama_memory_seq_rm(memory, 0, Int32(shared), -1) else {
+                // Partial removal unsupported for this memory type.
+                return discardEverything()
+            }
+
+            return shared
+        }
+
         private func generateTextStream(
             context: OpaquePointer,
             model: OpaquePointer,
             prompt: String,
             maxTokens: Int,
-            options: ResolvedGenerationOptions
+            options: ResolvedGenerationOptions,
+            cache: KVCacheState? = nil
         ) -> AsyncThrowingStream<String, Error> {
             return AsyncThrowingStream { continuation in
                 self.performTextGeneration(
@@ -1334,6 +1407,7 @@ import Foundation
                     prompt: prompt,
                     maxTokens: maxTokens,
                     options: options,
+                    cache: cache,
                     continuation: continuation
                 )
             }
@@ -1345,6 +1419,7 @@ import Foundation
             prompt: String,
             maxTokens: Int,
             options: ResolvedGenerationOptions,
+            cache: KVCacheState? = nil,
             continuation: AsyncThrowingStream<String, Error>.Continuation
         ) {
             do {
@@ -1364,14 +1439,25 @@ import Foundation
                 var batch = llama_batch_init(Int32(options.batchSize), 0, 1)
                 defer { llama_batch_free(batch) }
 
+                let reusedPrefix = reusableCachePrefix(
+                    cache: cache,
+                    promptTokens: promptTokens,
+                    model: model,
+                    context: context
+                )
+
                 let hasEncoder = try prepareInitialBatch(
                     batch: &batch,
                     promptTokens: promptTokens,
+                    reusedPrefix: reusedPrefix,
                     model: model,
                     vocab: vocab,
                     context: context,
                     batchSize: options.batchSize
                 )
+
+                // Everything through the prompt is now resident, whatever was reused.
+                cache?.tokens = promptTokens
 
                 // Initialize sampler chain with options
                 guard let sampler = llama_sampler_chain_init(llama_sampler_chain_default_params()) else {
@@ -1407,7 +1493,7 @@ import Foundation
                 // Generate tokens one by one
                 // Track position - for encoder-decoder models, we start from position 1 (after decoder start token)
                 // For decoder-only models, we continue from the end of the prompt
-                var n_cur: Int32 = hasEncoder ? 1 : batch.n_tokens
+                var n_cur: Int32 = hasEncoder ? 1 : Int32(promptTokens.count)
 
                 for _ in 0 ..< maxTokens {
                     // Sample next token from logits of the last token we just decoded
@@ -1423,6 +1509,9 @@ import Foundation
                     if let tokenText = tokenToText(vocab: vocab, token: nextToken) {
                         continuation.yield(tokenText)
                     }
+
+                    // The sampled token is about to be decoded, so it joins the resident prefix.
+                    cache?.tokens.append(nextToken)
 
                     // Prepare batch for next token
                     batch.n_tokens = 1
@@ -1480,13 +1569,18 @@ import Foundation
         private func prepareInitialBatch(
             batch: inout llama_batch,
             promptTokens: [llama_token],
+            reusedPrefix: Int = 0,
             model: OpaquePointer,
             vocab: OpaquePointer,
             context: OpaquePointer,
             batchSize: UInt32
         ) throws -> Bool {
-            // Validate that prompt token count doesn't exceed batch capacity to prevent buffer overflow
-            guard promptTokens.count <= batchSize else {
+            // Tokens up to `reusedPrefix` are already in the KV cache, so only the remainder is
+            // decoded — but it still occupies positions `reusedPrefix..<promptTokens.count`.
+            let pendingTokens = Array(promptTokens[reusedPrefix...])
+
+            // Validate that the tokens to decode don't exceed batch capacity to prevent buffer overflow
+            guard pendingTokens.count <= batchSize else {
                 throw LlamaLanguageModelError.insufficientMemory
             }
 
@@ -1494,7 +1588,8 @@ import Foundation
             let hasDecoder = llama_model_has_decoder(model)
 
             if hasEncoder {
-                // For encoder models, first encode the prompt
+                // For encoder models, first encode the prompt. Encoder state is not reused across
+                // turns, so the caller never hands these models a prefix.
                 batch.n_tokens = Int32(promptTokens.count)
                 for i in 0 ..< promptTokens.count {
                     let idx = Int(i)
@@ -1538,11 +1633,11 @@ import Foundation
                 }
             } else {
                 // Standard decoder-only model (most LLMs)
-                batch.n_tokens = Int32(promptTokens.count)
-                for i in 0 ..< promptTokens.count {
+                batch.n_tokens = Int32(pendingTokens.count)
+                for i in 0 ..< pendingTokens.count {
                     let idx = Int(i)
-                    batch.token[idx] = promptTokens[idx]
-                    batch.pos[idx] = Int32(i)
+                    batch.token[idx] = pendingTokens[idx]
+                    batch.pos[idx] = Int32(reusedPrefix + i)
                     batch.n_seq_id[idx] = 1
                     if let seq_ids = batch.seq_id, let seq_id = seq_ids[idx] {
                         seq_id[0] = 0
