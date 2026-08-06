@@ -108,6 +108,94 @@ struct TranscriptTests {
         }
     }
 
+    @Test func finalizeStreamedTranscriptKeepsSegmentsAheadOfTheStreamedText() throws {
+        let structured = Transcript.StructuredSegment(
+            id: "structured-id",
+            source: "source",
+            content: try GeneratedContent(json: #"{"ok":true}"#)
+        )
+        var transcript = Transcript(entries: [
+            .response(
+                .init(
+                    id: "response-id",
+                    assetIDs: [],
+                    segments: [
+                        .structure(structured),
+                        .text(.init(id: "text-id", content: "partial")),
+                    ]
+                )
+            )
+        ])
+
+        transcript.finalizeStreamedTranscript("complete", assetIDs: ["asset"])
+
+        guard case .response(let response)? = transcript.last else {
+            Issue.record("Expected a trailing response entry")
+            return
+        }
+        #expect(response.id == "response-id")
+        #expect(response.assetIDs == ["asset"])
+        #expect(response.segments.count == 2)
+        #expect(response.segments.first == .structure(structured))
+        // The trailing text segment is replaced in place, keeping its ID stable.
+        #expect(response.segments.last == .text(.init(id: "text-id", content: "complete")))
+    }
+
+    @Test func finalizeStreamedTranscriptAppendsTextWhenTrailingSegmentIsNotText() throws {
+        let structured = Transcript.StructuredSegment(
+            id: "structured-id",
+            source: "source",
+            content: try GeneratedContent(json: #"{"ok":true}"#)
+        )
+        var transcript = Transcript(entries: [
+            .response(.init(id: "response-id", assetIDs: [], segments: [.structure(structured)]))
+        ])
+
+        transcript.finalizeStreamedTranscript("complete", assetIDs: [])
+
+        guard case .response(let response)? = transcript.last else {
+            Issue.record("Expected a trailing response entry")
+            return
+        }
+        #expect(response.segments.count == 2)
+        #expect(response.segments.first == .structure(structured))
+        #expect(response.segments.last?.description == "complete")
+    }
+
+    @Test func finalizeStreamedTranscriptAppendsResponseWhenLastEntryIsNotAResponse() {
+        var transcript = Transcript(entries: [
+            .prompt(.init(id: "prompt-id", segments: [.text(.init(content: "Hello"))]))
+        ])
+
+        transcript.finalizeStreamedTranscript("complete", assetIDs: ["asset"])
+
+        #expect(transcript.count == 2)
+        guard case .response(let response)? = transcript.last else {
+            Issue.record("Expected a trailing response entry")
+            return
+        }
+        #expect(response.assetIDs == ["asset"])
+        #expect(response.segments.count == 1)
+        #expect(response.segments.first?.description == "complete")
+    }
+
+    @Test func appendStreamingResponseGrowsTheTrailingTextSegmentInPlace() {
+        var transcript = Transcript(entries: [
+            .prompt(.init(id: "prompt-id", segments: [.text(.init(content: "Hello"))]))
+        ])
+
+        transcript.appendStreamingResponse("He")
+        transcript.appendStreamingResponse("Hello")
+
+        #expect(transcript.count == 2)
+        guard case .response(let response)? = transcript.last else {
+            Issue.record("Expected a trailing response entry")
+            return
+        }
+        #expect(response.segments.count == 1)
+        #expect(response.segments.first?.description == "Hello")
+    }
+
     @Test func responseFormatNameExtractsRefTypeNameOrFallsBack() {
         let refFormat = Transcript.ResponseFormat(type: Person.self)
         #expect(refFormat.name.contains("Person"))
