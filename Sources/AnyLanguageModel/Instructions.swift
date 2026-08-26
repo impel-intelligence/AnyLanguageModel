@@ -84,7 +84,8 @@ public struct InstructionsBuilder {
     }
 
     public static func buildLimitedAvailability(_ instructions: some InstructionsRepresentable)
-        -> Instructions {
+        -> Instructions
+    {
         return instructions.instructionsRepresentation
     }
 }

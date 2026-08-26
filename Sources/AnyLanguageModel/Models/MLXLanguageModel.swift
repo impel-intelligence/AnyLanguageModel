@@ -53,7 +53,8 @@ import Foundation
         ) async throws -> ModelContext {
             let cacheKey = key as NSString
             if let cached = cache.object(forKey: cacheKey),
-                case .loaded(let context) = cached.value {
+                case .loaded(let context) = cached.value
+            {
                 return context
             }
 
@@ -853,7 +854,8 @@ import Foundation
             let existingEntry = getSessionCache(for: session)
 
             if let existingEntry,
-                isCacheHit(entry: existingEntry, currentTokens: fullTokens, signature: signature, lmInput: lmInput) {
+                isCacheHit(entry: existingEntry, currentTokens: fullTokens, signature: signature, lmInput: lmInput)
+            {
                 let cachedCount = existingEntry.prefillTokenCount
                 let newTokens = lmInput.text.tokens[cachedCount...]
                 let newMask = lmInput.text.mask?[cachedCount...]
@@ -1334,7 +1336,12 @@ import Foundation
                     let lmInput = try await context.processor.prepare(input: userInput)
 
                     let state: MLXLMCommon.LMOutput.State? = nil
-                    let prepareResult = try context.model.prepare(lmInput, cache: newCache, state: state, windowSize: params.prefill.stepSize)
+                    let prepareResult = try context.model.prepare(
+                        lmInput,
+                        cache: newCache,
+                        state: state,
+                        windowSize: params.prefill.stepSize
+                    )
                     switch prepareResult {
                     case .tokens(let tokensToProcess):
                         _ = context.model(tokensToProcess[text: .newAxis], cache: newCache, state: state)
@@ -1359,7 +1366,9 @@ import Foundation
     /// Recover temperature, topP and topK from Foundation Models sampling parameters.
     /// - Parameter sampling: The sampling options
     /// - Returns: Temperature, topP, and topK. Temperature is a double to match GenerationOptions.temperature
-    private func parametersFromSampling(sampling: GenerationOptions.SamplingMode?) -> (temperature: Double?, topP: Float?, topK: Int?) {
+    private func parametersFromSampling(sampling: GenerationOptions.SamplingMode?) -> (
+        temperature: Double?, topP: Float?, topK: Int?
+    ) {
         guard let sampling else { return (nil, nil, nil) }
 
         switch sampling.mode {
@@ -1426,7 +1435,8 @@ import Foundation
         // Add instructions from session if present and not in transcript
         if !hasInstructionsInTranscript,
             let instructions = session.instructions?.description,
-            !instructions.isEmpty {
+            !instructions.isEmpty
+        {
             chat.append(.init(role: .system, content: instructions))
         }
 
@@ -1489,12 +1499,14 @@ import Foundation
                 case .data(let data, _):
                     #if canImport(UIKit)
                         if let uiImage = UIKit.UIImage(data: data),
-                            let ciImage = CIImage(image: uiImage) {
+                            let ciImage = CIImage(image: uiImage)
+                        {
                             images.append(.ciImage(ciImage))
                         }
                     #elseif canImport(AppKit)
                         if let nsImage = AppKit.NSImage(data: data),
-                            let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                            let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil)
+                        {
                             let ciImage = CIImage(cgImage: cgImage)
                             images.append(.ciImage(ciImage))
                         }
@@ -1533,12 +1545,12 @@ import Foundation
         let functionSpec: [String: any Sendable] = [
             "name": tool.name,
             "description": tool.description,
-            "parameters": parametersDict
+            "parameters": parametersDict,
         ]
 
         let toolSpec: ToolSpec = [
             "type": "function",
-            "function": functionSpec
+            "function": functionSpec,
         ]
 
         return toolSpec
@@ -1548,7 +1560,7 @@ import Foundation
         [
             "type": "object",
             "properties": [String: any Sendable](),
-            "required": [String]()
+            "required": [String](),
         ]
     }
 
@@ -1653,11 +1665,13 @@ import Foundation
 
         if let constValue = jsonSchema.const,
             let data = try? encoder.encode(constValue),
-            let constString = String(data: data, encoding: .utf8) {
+            let constString = String(data: data, encoding: .utf8)
+        {
             header += ". Expected value: \(constString)"
         } else if let enumValues = jsonSchema.enum, !enumValues.isEmpty,
             let data = try? encoder.encode(enumValues),
-            let enumString = String(data: data, encoding: .utf8) {
+            let enumString = String(data: data, encoding: .utf8)
+        {
             header += ". Allowed values: \(enumString)"
         }
 

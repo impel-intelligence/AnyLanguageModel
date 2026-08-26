@@ -76,7 +76,7 @@ struct MockLanguageModelTests {
         for (instructionText, expected) in [
             ("Be helpful", "😇"),
             ("Be evil", "😈"),
-            ("Meh", "😐")
+            ("Meh", "😐"),
         ] {
             let session = LanguageModelSession(
                 model: model,
@@ -294,7 +294,7 @@ struct MockLanguageModelTests {
 
         let images: [Transcript.ImageSegment] = [
             .init(url: testImageURL),
-            .init(data: testImageData, mimeType: "image/png")
+            .init(data: testImageData, mimeType: "image/png"),
         ]
         let response = try await session.respond(to: "Classify these", images: images)
 
@@ -359,7 +359,7 @@ struct MockLanguageModelTests {
 
         let images: [Transcript.ImageSegment] = [
             .init(url: testImageURL),
-            .init(data: testImageData, mimeType: "image/png")
+            .init(data: testImageData, mimeType: "image/png"),
         ]
         let stream = session.streamResponse(to: "Stream about images", images: images)
 

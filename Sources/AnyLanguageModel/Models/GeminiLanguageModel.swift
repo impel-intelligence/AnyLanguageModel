@@ -533,7 +533,8 @@ public struct GeminiLanguageModel: LanguageModel {
     }
 
     private func buildTools(from tools: [any Tool], serverTools: [CustomGenerationOptions.ServerTool]) throws
-        -> [GeminiTool]? {
+        -> [GeminiTool]?
+    {
         var geminiTools: [GeminiTool] = []
 
         if !tools.isEmpty {
@@ -807,7 +808,7 @@ private enum GeminiTool: Sendable {
                 "retrievalConfig": .object([
                     "latLng": .object([
                         "latitude": .double(lat),
-                        "longitude": .double(lng)
+                        "longitude": .double(lng),
                     ])
                 ])
             ])
