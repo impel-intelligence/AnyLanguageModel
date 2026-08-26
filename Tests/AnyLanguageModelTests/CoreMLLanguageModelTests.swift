@@ -300,6 +300,68 @@ import Testing
             #expect(!response.content.colors.isEmpty)
         }
 
+        /// Requires a model whose chat template supports tools. The template renders the tool specs,
+        /// the model answers with tool-call text, and the parser turns that back into transcript
+        /// entries.
+        @Test @available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, watchOS 11.0, *)
+        func withTools() async throws {
+            let model = try await getModel()
+            let weatherTool = WeatherTool()
+            let session = LanguageModelSession(model: model, tools: [weatherTool])
+
+            let response = try await session.respond(to: "How's the weather in San Francisco?")
+
+            var foundToolOutput = false
+            for case let .toolOutput(toolOutput) in response.transcriptEntries {
+                #expect(!toolOutput.id.isEmpty)
+                #expect(toolOutput.toolName == "getWeather")
+                foundToolOutput = true
+            }
+            #expect(foundToolOutput)
+        }
+
+        @Test @available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, watchOS 11.0, *)
+        func streamWithTools() async throws {
+            let model = try await getModel()
+            let weatherTool = WeatherTool()
+            let session = LanguageModelSession(model: model, tools: [weatherTool])
+
+            let stream = session.streamResponse(to: "How's the weather in San Francisco?")
+
+            var snapshots: [LanguageModelSession.ResponseStream<String>.Snapshot] = []
+
+            var toolAppearedInTranscript: Bool = false
+            var toolResponseAppearedInTranscript: Bool = false
+
+            for try await snapshot in stream {
+                snapshots.append(snapshot)
+
+                for entry in session.transcript {
+                    switch entry {
+                    case .toolCalls:
+                        toolAppearedInTranscript = true
+                    case .toolOutput:
+                        toolResponseAppearedInTranscript = true
+                    default: break
+                    }
+                }
+            }
+
+            #expect(toolAppearedInTranscript, "Expected a tool call to appear in the transcript during streaming.")
+            #expect(
+                toolResponseAppearedInTranscript,
+                "Expected a tool output to appear in the transcript during streaming."
+            )
+
+            // Tool-call markup must never be published as assistant text.
+            if #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, watchOS 26.0, *) {
+                for snapshot in snapshots {
+                    #expect(!snapshot.content.contains("<tool_call>"))
+                    #expect(!snapshot.content.contains("[TOOL_CALLS]"))
+                }
+            }
+        }
+
         @Test @available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, watchOS 11.0, *)
         func structuredGenerationNestedStruct() async throws {
             let model = try await getModel()
@@ -315,6 +377,149 @@ import Testing
             #expect(response.content.age >= 0)
             #expect(!response.content.address.street.isEmpty)
             #expect(!response.content.address.city.isEmpty)
+        }
+    }
+
+    /// Exercises the tool-call text formats the Core ML provider claims to support. These need no
+    /// downloaded model, so unlike the suite above they run everywhere the CoreML trait is enabled.
+    @Suite("CoreMLToolCallParsing")
+    struct CoreMLToolCallParsingTests {
+        private let knownToolNames: Set<String> = ["getWeather"]
+
+        @Test func parsesHermesStyleTaggedCall() {
+            let result = CoreMLToolCallParser.parse(
+                "Let me look that up.\n<tool_call>\n{\"name\": \"getWeather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
+                knownToolNames: knownToolNames
+            )
+
+            #expect(result.visibleText == "Let me look that up.")
+            #expect(result.calls.count == 1)
+            #expect(result.calls.first?.name == "getWeather")
+            #expect(result.calls.first?.argumentsJSON == "{\"city\":\"Paris\"}")
+        }
+
+        @Test func parsesMultipleTaggedCalls() {
+            let result = CoreMLToolCallParser.parse(
+                "<tool_call>{\"name\": \"getWeather\", \"arguments\": {\"city\": \"Paris\"}}</tool_call>"
+                    + "<tool_call>{\"name\": \"getWeather\", \"arguments\": {\"city\": \"Oslo\"}}</tool_call>",
+                knownToolNames: knownToolNames
+            )
+
+            #expect(result.calls.count == 2)
+            #expect(result.visibleText.isEmpty)
+        }
+
+        @Test func parsesMistralToolCallsMarker() {
+            let result = CoreMLToolCallParser.parse(
+                "[TOOL_CALLS] [{\"name\": \"getWeather\", \"arguments\": {\"city\": \"Paris\"}}]",
+                knownToolNames: knownToolNames
+            )
+
+            #expect(result.calls.count == 1)
+            #expect(result.calls.first?.name == "getWeather")
+            #expect(result.visibleText.isEmpty)
+        }
+
+        @Test func parsesLlamaPythonTagWithParametersKey() {
+            let result = CoreMLToolCallParser.parse(
+                "<|python_tag|>{\"name\": \"getWeather\", \"parameters\": {\"city\": \"Paris\"}}",
+                knownToolNames: knownToolNames
+            )
+
+            #expect(result.calls.count == 1)
+            #expect(result.calls.first?.argumentsJSON == "{\"city\":\"Paris\"}")
+        }
+
+        @Test func parsesArgumentsEncodedAsJSONString() {
+            let result = CoreMLToolCallParser.parse(
+                "<tool_call>{\"name\": \"getWeather\", \"arguments\": \"{\\\"city\\\": \\\"Paris\\\"}\"}</tool_call>",
+                knownToolNames: knownToolNames
+            )
+
+            #expect(result.calls.first?.argumentsJSON == "{\"city\":\"Paris\"}")
+        }
+
+        @Test func parsesOpenAIFunctionEnvelope() {
+            let result = CoreMLToolCallParser.parse(
+                "<tool_call>{\"type\": \"function\", \"function\": {\"name\": \"getWeather\", \"arguments\": {\"city\": \"Paris\"}}}</tool_call>",
+                knownToolNames: knownToolNames
+            )
+
+            #expect(result.calls.first?.name == "getWeather")
+        }
+
+        @Test func parsesBareJSONOnlyForKnownTools() {
+            let text = "{\"name\": \"getWeather\", \"arguments\": {\"city\": \"Paris\"}}"
+
+            let known = CoreMLToolCallParser.parse(text, knownToolNames: knownToolNames)
+            #expect(known.calls.count == 1)
+
+            let unknown = CoreMLToolCallParser.parse(text, knownToolNames: [])
+            #expect(unknown.calls.isEmpty)
+            #expect(unknown.visibleText == text)
+        }
+
+        @Test func treatsPlainProseAsText() {
+            let result = CoreMLToolCallParser.parse(
+                "The weather in Paris is sunny.",
+                knownToolNames: knownToolNames
+            )
+
+            #expect(result.calls.isEmpty)
+            #expect(result.visibleText == "The weather in Paris is sunny.")
+        }
+
+        @Test func treatsUnparseableTagBodyAsText() {
+            let text = "<tool_call>not json</tool_call>"
+            let result = CoreMLToolCallParser.parse(text, knownToolNames: knownToolNames)
+
+            #expect(result.calls.isEmpty)
+            #expect(result.visibleText == text)
+        }
+
+        @Test func withholdsToolCallMarkupWhileStreaming() {
+            #expect(
+                CoreMLToolCallParser.visibleTextForStreaming("Checking. <tool_call>{\"na")
+                    == "Checking. "
+            )
+            #expect(CoreMLToolCallParser.visibleTextForStreaming("[TOOL_CALLS] [{\"na").isEmpty)
+            #expect(CoreMLToolCallParser.visibleTextForStreaming("{\"name\": \"get").isEmpty)
+            #expect(
+                CoreMLToolCallParser.visibleTextForStreaming("The weather is") == "The weather is"
+            )
+        }
+
+        @Test func signatureDistinguishesArgumentsAndIgnoresKeyOrder() {
+            let first = CoreMLToolCallParser.parse(
+                "<tool_call>{\"name\": \"getWeather\", \"arguments\": {\"city\": \"Paris\", \"unit\": \"C\"}}</tool_call>",
+                knownToolNames: knownToolNames
+            )
+            let reordered = CoreMLToolCallParser.parse(
+                "<tool_call>{\"name\": \"getWeather\", \"arguments\": {\"unit\": \"C\", \"city\": \"Paris\"}}</tool_call>",
+                knownToolNames: knownToolNames
+            )
+            let different = CoreMLToolCallParser.parse(
+                "<tool_call>{\"name\": \"getWeather\", \"arguments\": {\"city\": \"Oslo\"}}</tool_call>",
+                knownToolNames: knownToolNames
+            )
+
+            #expect(
+                CoreMLToolCallParser.signature(for: first.calls)
+                    == CoreMLToolCallParser.signature(for: reordered.calls)
+            )
+            #expect(
+                CoreMLToolCallParser.signature(for: first.calls)
+                    != CoreMLToolCallParser.signature(for: different.calls)
+            )
+        }
+
+        @Test func toolCallIDsAreNineAlphanumericCharacters() {
+            // Mistral's chat template rejects anything else.
+            for _ in 0 ..< 32 {
+                let id = CoreMLToolCallParser.makeToolCallID()
+                #expect(id.count == 9)
+                #expect(id.allSatisfy { $0.isLetter || $0.isNumber })
+            }
         }
     }
 #endif  // CoreML
