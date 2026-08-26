@@ -179,6 +179,75 @@ struct TranscriptTests {
         #expect(response.segments.first?.description == "complete")
     }
 
+    @Test func finalizeStreamedTranscriptLeavesTurnsThatEndedInToolCallsAlone() throws {
+        let arguments = try GeneratedContent(json: #"{"city":"Cupertino"}"#)
+        let toolCalls = Transcript.ToolCalls(
+            id: "tool-calls-id",
+            [Transcript.ToolCall(id: "call-id", toolName: "getWeather", arguments: arguments)]
+        )
+        var transcript = Transcript(entries: [
+            .prompt(.init(id: "prompt-id", segments: [.text(.init(content: "Hello"))]))
+        ])
+        transcript.appendStreamingResponse("Let me check")
+        transcript.append(.toolCalls(toolCalls))
+
+        transcript.finalizeStreamedTranscript("Let me check", assetIDs: [])
+
+        // The streamed text is already recorded ahead of the tool calls, so nothing is appended.
+        #expect(transcript.count == 3)
+        guard case .toolCalls(let trailing)? = transcript.last else {
+            Issue.record("Expected a trailing tool calls entry")
+            return
+        }
+        #expect(trailing.id == "tool-calls-id")
+        guard case .response(let response) = transcript[1] else {
+            Issue.record("Expected a response entry ahead of the tool calls")
+            return
+        }
+        #expect(response.segments.count == 1)
+        #expect(response.segments.first?.description == "Let me check")
+    }
+
+    @Test func finalizeStreamedTranscriptKeepsAssetIDsAlreadyRecorded() {
+        var transcript = Transcript(entries: [
+            .response(
+                .init(
+                    id: "response-id",
+                    assetIDs: ["existing"],
+                    segments: [.text(.init(id: "text-id", content: "partial"))]
+                )
+            )
+        ])
+
+        transcript.finalizeStreamedTranscript("complete", assetIDs: [])
+
+        guard case .response(let response)? = transcript.last else {
+            Issue.record("Expected a trailing response entry")
+            return
+        }
+        #expect(response.assetIDs == ["existing"])
+    }
+
+    @Test func finalizeStreamedTranscriptMergesNewAssetIDsWithoutDuplicating() {
+        var transcript = Transcript(entries: [
+            .response(
+                .init(
+                    id: "response-id",
+                    assetIDs: ["existing"],
+                    segments: [.text(.init(id: "text-id", content: "partial"))]
+                )
+            )
+        ])
+
+        transcript.finalizeStreamedTranscript("complete", assetIDs: ["existing", "added"])
+
+        guard case .response(let response)? = transcript.last else {
+            Issue.record("Expected a trailing response entry")
+            return
+        }
+        #expect(response.assetIDs == ["existing", "added"])
+    }
+
     @Test func appendStreamingResponseGrowsTheTrailingTextSegmentInPlace() {
         var transcript = Transcript(entries: [
             .prompt(.init(id: "prompt-id", segments: [.text(.init(content: "Hello"))]))

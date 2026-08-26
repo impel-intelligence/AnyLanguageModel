@@ -26,50 +26,12 @@ public struct Transcript: Sendable, Equatable, Codable {
         entries[index] = entry
     }
 
-    /// Updates a transcript with temporary text that is being streamed from a model.
-    /// Appends the assistant response to the end of entries, if the last entry is a response then that response is updated with the newest streamed text.
-    ///
-    /// - Parameter text: The text to update the transcript with.
-    mutating func appendStreamingResponse(_ text: String) {
-        // Make sure the last entry in the transcript is a response. If it is not, create a new response and append it to the end of the transcript.
-        guard case .response(var response) = entries.last else {
-            append(
-                Entry.response(
-                    Response(
-                        assetIDs: [],
-                        segments: [
-                            Transcript.Segment.text(Transcript.TextSegment(content: text))
-                        ]
-                    )
-                )
-            )
-            return
-        }
-
-        // If the last segment in the last response is text, replace it with the new content.
-        if case .text(let last)? = response.segments.last {
-            // Keep the same ID as the last segment.
-            response.segments[response.segments.count - 1] = Transcript.Segment.text(
-                Transcript.TextSegment(id: last.id, content: text)
-            )
-        } else {
-            response.segments.append(Transcript.Segment.text(Transcript.TextSegment(content: text)))
-        }
-
-        // Replace the latest entry with the one we just updated.
-        replace(index: entries.count - 1, with: .response(response))
-    }
-
-    /// Replaces the trailing response entry's streamed text with the final text, or appends a new response entry if the last entry isn't a response.
-    /// Prevents streamed responses from having duplicate entries on completion.
-    ///
-    /// Segments ahead of the trailing text are left alone, so anything else the model
-    /// produced during the same response survives the end of the stream.
+    /// Replace a trailing response entry with `text`. If `assetIDs` is populated and there is no existing response these IDs will be used as the IDs for the response. If a response already exists, they will be appended to any existing IDs.
     ///
     /// - Parameters:
-    ///   - text: The text to replace the final response with.
-    ///   - assetIDs: The assetIDs for the response.
-    mutating func finalizeStreamedTranscript(_ text: String, assetIDs: [String]) {
+    ///   - text: The text to replace the trailing response with.
+    ///   - assetIDs: The asset IDs to use for the response.
+    private mutating func replaceOrAppendTrailingResponse(text: String, assetIDs: [String]) {
         // Make sure the last entry in the transcript is a response. If it is not, create a new response and append it to the end of the transcript.
         guard case .response(var response) = entries.last else {
             append(
@@ -94,10 +56,43 @@ public struct Transcript: Sendable, Equatable, Codable {
         } else {
             response.segments.append(Transcript.Segment.text(Transcript.TextSegment(content: text)))
         }
-        response.assetIDs = assetIDs
+
+        // Asset IDs identify everything used to generate the response, so keep the ones the
+        // in-progress response already recorded and add whatever the finalized one introduced.
+        for assetID in assetIDs where !response.assetIDs.contains(assetID) {
+            response.assetIDs.append(assetID)
+        }
 
         // Replace the latest entry with the one we just updated.
         replace(index: entries.count - 1, with: .response(response))
+    }
+
+    /// Updates a transcript with temporary text that is being streamed from a model.
+    /// Appends the assistant response to the end of entries, if the last entry is a response then that response is updated with the newest streamed text.
+    ///
+    /// - Parameter text: The text to update the transcript with.
+    mutating func appendStreamingResponse(_ text: String) {
+        replaceOrAppendTrailingResponse(text: text, assetIDs: [])
+    }
+
+    /// Replaces the trailing response entry's streamed text with the final text, or appends a new response entry if the last entry isn't a response.
+    /// Prevents streamed responses from having duplicate entries on completion.
+    ///
+    /// Segments ahead of the trailing text are left alone, so anything else the model
+    /// produced during the same response survives the end of the stream.
+    ///
+    /// - Parameters:
+    ///   - text: The text to replace the final response with.
+    ///   - assetIDs: The assetIDs for the response.
+    mutating func finalizeStreamedTranscript(_ text: String, assetIDs: [String]) {
+        // A turn that ended in tool calls already recorded its streamed text in the response
+        // entry ahead of them, so there is nothing left to finalize. Appending here would
+        // duplicate that text after the tool calls.
+        if case .toolCalls = entries.last {
+            return
+        }
+
+        replaceOrAppendTrailingResponse(text: text, assetIDs: assetIDs)
     }
 
     /// An entry in a transcript.
