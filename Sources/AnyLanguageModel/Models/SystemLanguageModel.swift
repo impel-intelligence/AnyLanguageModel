@@ -115,7 +115,8 @@
                     if let jsonValue = try? JSONValue(normalizedRaw),
                         case .array(let values) = jsonValue,
                         values.isEmpty,
-                        let placeholder = placeholderContent(for: type) {
+                        let placeholder = placeholderContent(for: type)
+                    {
                         return LanguageModelSession.Response(
                             content: placeholder.content,
                             rawContent: placeholder.rawContent,
@@ -139,7 +140,8 @@
                     let decoder = PartialJSONDecoder()
                     let jsonString = fmResponse.content.jsonString
                     if let partialContent = try? decoder.decode(GeneratedContent.self, from: jsonString).value,
-                        let content = try? type.init(partialContent) {
+                        let content = try? type.init(partialContent)
+                    {
                         return finalize(content: content)
                     }
                     if let placeholder = placeholderContent(for: type) {
@@ -560,7 +562,8 @@
 
                 // Convert root schema
                 if let rootData = try? JSONEncoder().encode(JSONValue.object(rootObject)),
-                    let rootJSONSchema = try? JSONDecoder().decode(JSONSchema.self, from: rootData) {
+                    let rootJSONSchema = try? JSONDecoder().decode(JSONSchema.self, from: rootData)
+                {
                     let rootDynamicSchema = convertToDynamicSchema(rootJSONSchema)
 
                     // Convert each dependency schema
@@ -609,7 +612,8 @@
     @available(macOS 26.0, iOS 26.0, watchOS 26.0, tvOS 26.0, visionOS 26.0, *)
     extension Tool {
         fileprivate func callFunction(arguments: FoundationModels.GeneratedContent) async throws
-            -> any PromptRepresentable {
+            -> any PromptRepresentable
+        {
             let content = try GeneratedContent(arguments)
             return try await call(arguments: Self.Arguments(content))
         }
@@ -880,7 +884,8 @@
                 return .text(.init(id: textSegment.id, content: textSegment.content))
             }
             if case .structure(let structuredSegment) = segment,
-                let content = try? AnyLanguageModel.GeneratedContent(structuredSegment.content) {
+                let content = try? AnyLanguageModel.GeneratedContent(structuredSegment.content)
+            {
                 return .structure(
                     .init(
                         id: structuredSegment.id,

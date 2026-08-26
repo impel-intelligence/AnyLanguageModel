@@ -151,7 +151,8 @@ public struct OpenResponsesLanguageModel: LanguageModel {
 
             public init(from decoder: Decoder) throws {
                 if let singleValueContainer = try? decoder.singleValueContainer(),
-                    let stringValue = try? singleValueContainer.decode(String.self) {
+                    let stringValue = try? singleValueContainer.decode(String.self)
+                {
                     switch stringValue {
                     case "none": self = .none
                     case "auto": self = .auto
@@ -660,7 +661,7 @@ private enum OpenResponsesAPI {
     ) throws -> JSONValue {
         var body: [String: JSONValue] = [
             "model": .string(model),
-            "stream": .bool(stream)
+            "stream": .bool(stream),
         ]
         var input: [JSONValue] = []
         for msg in messages {
@@ -683,7 +684,7 @@ private enum OpenResponsesAPI {
                     .object([
                         "type": .string("message"),
                         "role": .string("user"),
-                        "content": .array(contentBlocks)
+                        "content": .array(contentBlocks),
                     ])
                 )
             case .tool(let id):
@@ -714,7 +715,7 @@ private enum OpenResponsesAPI {
                     .object([
                         "type": .string("function_call_output"),
                         "call_id": .string(id),
-                        "output": .string(outputString)
+                        "output": .string(outputString),
                     ])
                 )
             case .raw(rawContent: let raw):
@@ -746,7 +747,7 @@ private enum OpenResponsesAPI {
                     "type": .string("json_schema"),
                     "name": .string("response_schema"),
                     "strict": .bool(true),
-                    "schema": schemaValue
+                    "schema": schemaValue,
                 ])
             ])
         }
@@ -811,7 +812,8 @@ private enum OpenResponsesAPI {
 }
 
 private func openResponsesToolChoiceJSON(_ choice: OpenResponsesLanguageModel.CustomGenerationOptions.ToolChoice)
-    -> JSONValue {
+    -> JSONValue
+{
     switch choice {
     case .none: return .string("none")
     case .auto: return .string("auto")
@@ -822,7 +824,7 @@ private func openResponsesToolChoiceJSON(_ choice: OpenResponsesLanguageModel.Cu
         return .object([
             "type": .string("allowed_tools"),
             "tools": .array(tools.map { .object(["type": .string("function"), "name": .string($0)]) }),
-            "mode": .string(mode.rawValue)
+            "mode": .string(mode.rawValue),
         ])
     }
 }
@@ -886,7 +888,7 @@ extension Transcript {
                         "type": .string("function_call"),
                         "call_id": .string(call.id),
                         "name": .string(call.toolName),
-                        "arguments": .string(argsStr)
+                        "arguments": .string(argsStr),
                     ])
                 }
                 list.append(
@@ -895,7 +897,7 @@ extension Transcript {
                             rawContent: .object([
                                 "type": .string("message"),
                                 "role": .string("assistant"),
-                                "content": .array(rawCalls)
+                                "content": .array(rawCalls),
                             ])
                         ),
                         content: .text("")
@@ -959,7 +961,7 @@ private struct OpenResponsesTool: Sendable {
         var obj: [String: JSONValue] = [
             "type": .string(type),
             "name": .string(name),
-            "description": .string(description)
+            "description": .string(description),
         ]
         if let p = parameters { obj["parameters"] = p }
         return .object(obj)
@@ -1027,7 +1029,8 @@ private func collectOpenResponsesToolCalls(from value: JSONValue, into result: i
                 }
             }
             if typeStr == "message",
-                let content = obj["content"] {
+                let content = obj["content"]
+            {
                 switch content {
                 case .array(let arr):
                     for item in arr { collectOpenResponsesToolCalls(from: item, into: &result) }

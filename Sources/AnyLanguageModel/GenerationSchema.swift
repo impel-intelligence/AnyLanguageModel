@@ -457,7 +457,8 @@ public struct GenerationSchema: Equatable, Codable, CustomDebugStringConvertible
 
     func withResolvedRoot() -> GenerationSchema? {
         if case .ref(let refName) = root,
-            let defNode = defs[refName] {
+            let defNode = defs[refName]
+        {
             return GenerationSchema(root: defNode, defs: defs)
         }
         return nil
