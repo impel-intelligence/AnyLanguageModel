@@ -1300,6 +1300,70 @@ import Foundation
             return LanguageModelSession.ResponseStream(stream: stream)
         }
 
+        public func _prewarm(
+            for session: LanguageModelSession,
+            promptPrefix: Prompt?,
+            modelID: String,
+            hub: HubClient?,
+            directory: URL?
+        ) async throws {
+            guard Self.acquireGenerationSlot(for: session) else {
+                return
+            }
+            defer { Self.releaseGenerationSlot(for: session) }
+
+            let generationScope = beginGenerationScope()
+            defer { endGenerationScope(generationScope) }
+
+            let context = try await loadContext(modelId: modelId, hub: hub, directory: directory)
+            guard let instructions = session.instructions?.description, !instructions.isEmpty else {
+                return
+            }
+
+            let toolSpecs = mlxToolSpecs(for: session)
+
+            let params = toGenerateParameters(.init())
+            let newCache = context.model.newCache(parameters: params)
+            let userInput = MLXLMCommon.UserInput(
+                chat: [.init(role: .system, content: instructions)],
+                processing: .init(resize: nil),
+                tools: toolSpecs
+            )
+            let lmInput = try await context.processor.prepare(input: userInput)
+            
+            let state: MLXLMCommon.LMOutput.State? = nil
+            let prepareResult = try context.model.prepare(lmInput, cache: newCache, state: state, windowSize: params.prefill.stepSize)
+            switch prepareResult {
+            case .tokens(let tokensToProcess):
+                _ = context.model(tokensToProcess[text: .newAxis], cache: newCache, state: state)
+            case .logits:
+                break
+            }
+            storeSessionCache(
+                cache: newCache,
+                fullTokens: tokens(from: lmInput),
+                generateParameters: params,
+                session: session
+            )
+        }
+        
+        public func prewarm(
+            for session: LanguageModelSession,
+            promptPrefix: Prompt?
+        ) async throws {
+            let modelId = self.modelId
+            let hub = self.hub
+            let directory = self.directory
+
+            try await _prewarm(
+                for: session,
+                promptPrefix: promptPrefix,
+                modelID: modelId,
+                hub: hub,
+                directory: directory
+           )
+        }
+        
         /// Prewarms the model
         public func prewarm(
             for session: LanguageModelSession,
@@ -1310,48 +1374,13 @@ import Foundation
             let directory = self.directory
 
             Task {
-                guard Self.acquireGenerationSlot(for: session) else {
-                    return
-                }
-                defer { Self.releaseGenerationSlot(for: session) }
-
-                let generationScope = beginGenerationScope()
-                defer { endGenerationScope(generationScope) }
-
-                do {
-                    let context = try await loadContext(modelId: modelId, hub: hub, directory: directory)
-                    guard let instructions = session.instructions?.description, !instructions.isEmpty else {
-                        return
-                    }
-
-                    let toolSpecs = mlxToolSpecs(for: session)
-
-                    let params = toGenerateParameters(.init())
-                    let newCache = context.model.newCache(parameters: params)
-                    let userInput = MLXLMCommon.UserInput(
-                        chat: [.init(role: .system, content: instructions)],
-                        processing: .init(resize: nil),
-                        tools: toolSpecs
-                    )
-                    let lmInput = try await context.processor.prepare(input: userInput)
-                    
-                    let state: MLXLMCommon.LMOutput.State? = nil
-                    let prepareResult = try context.model.prepare(lmInput, cache: newCache, state: state, windowSize: params.prefill.stepSize)
-                    switch prepareResult {
-                    case .tokens(let tokensToProcess):
-                        _ = context.model(tokensToProcess[text: .newAxis], cache: newCache, state: state)
-                    case .logits:
-                        break
-                    }
-                    storeSessionCache(
-                        cache: newCache,
-                        fullTokens: tokens(from: lmInput),
-                        generateParameters: params,
-                        session: session
-                    )
-                } catch {
-                    // Ignore errors during prewarm
-                }
+                try await _prewarm(
+                    for: session,
+                    promptPrefix: promptPrefix,
+                    modelID: modelId,
+                    hub: hub,
+                    directory: directory
+                )
             }
         }
     }

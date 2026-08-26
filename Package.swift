@@ -26,7 +26,7 @@ let package = Package(
         .trait(name: "MLX"),
         .trait(name: "Llama"),
         .trait(name: "AsyncHTTPClient"),
-        .default(enabledTraits: []),
+        .default(enabledTraits: ["MLX"]),
     ],
     dependencies: [
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"),
