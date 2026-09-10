@@ -44,7 +44,7 @@ let package = Package(
         .package(url: "https://github.com/mattt/PartialJSONDecoder", from: "1.0.0"),
         // Fork is here since the mlx-swift-lm main repo is slow to update.
         //        .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "3.0.0"),
-        .package(url: "https://github.com/impel-intelligence/mlx-swift-lm", from: "1.0.1"),
+        .package(url: "https://github.com/impel-intelligence/mlx-swift-lm", from: "1.0.1", traits: []),
         .package(url: "https://github.com/swiftlang/swift-syntax", from: "602.0.0"),
         .package(url: "https://github.com/swift-server/async-http-client.git", from: "1.24.0"),
     ],
