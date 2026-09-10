@@ -848,7 +848,7 @@ import Foundation
             lmInput: MLXLMCommon.LMInput,
             generateParameters: MLXLMCommon.GenerateParameters,
             context: ModelContext
-        ) -> (cache: [MLXLMCommon.KVCache], input: MLXLMCommon.LMInput, fullTokens: [Int32]) {
+        ) throws -> (cache: [MLXLMCommon.KVCache], input: MLXLMCommon.LMInput, fullTokens: [Int32]) {
             let signature = cacheSignature(from: generateParameters)
             let fullTokens = tokens(from: lmInput)
             let existingEntry = getSessionCache(for: session)
@@ -867,7 +867,7 @@ import Foundation
                 removeSessionCache(for: session)
             }
 
-            let newCache = context.model.newCache(parameters: generateParameters)
+            let newCache = try context.model.newCache(parameters: generateParameters)
             return (newCache, lmInput, fullTokens)
         }
 
@@ -985,7 +985,7 @@ import Foundation
                     additionalContext: additionalContext
                 )
                 let lmInput = try await context.processor.prepare(input: userInput)
-                let resolved = resolveCache(
+                let resolved = try resolveCache(
                     session: session,
                     lmInput: lmInput,
                     generateParameters: generateParameters,
@@ -1011,6 +1011,8 @@ import Foundation
                         break
                     case .toolCall(let call):
                         collectedToolCalls.append(call)
+                    case .rejectedToolCall(_):
+                        break
                     }
                 }
                 storeSessionCache(
@@ -1168,7 +1170,7 @@ import Foundation
                                 additionalContext: additionalContext
                             )
                             let lmInput = try await context.processor.prepare(input: userInput)
-                            let resolved = resolveCache(
+                            let resolved = try resolveCache(
                                 session: session,
                                 lmInput: lmInput,
                                 generateParameters: generateParameters,
@@ -1205,6 +1207,8 @@ import Foundation
                                     break
                                 case .toolCall(let call):
                                     collectedToolCalls.append(call)
+                                case .rejectedToolCall(_):
+                                    break
                                 }
                             }
 
@@ -1323,7 +1327,7 @@ import Foundation
             let toolSpecs = mlxToolSpecs(for: session)
 
             let params = toGenerateParameters(.init())
-            let newCache = context.model.newCache(parameters: params)
+            let newCache = try context.model.newCache(parameters: params)
             let userInput = MLXLMCommon.UserInput(
                 chat: [.init(role: .system, content: instructions)],
                 processing: .init(resize: nil),
@@ -1840,7 +1844,7 @@ import Foundation
             self.model = context.model
             self.tokenizer = context.tokenizer
             self.state = nil
-            self.cache = context.model.newCache(parameters: parameters)
+            self.cache = try context.model.newCache(parameters: parameters)
             self.processor = parameters.processor()
             self.sampler = parameters.sampler()
             self.remainingTokens = maximumTokens
